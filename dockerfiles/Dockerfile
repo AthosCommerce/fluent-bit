@@ -62,7 +62,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         lsb-release \ 
         wget \
-    &&   wget https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
+    &&  wget https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
     && apt-get install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
     && rm -rf ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
     && apt-get update && apt-get install -y -V libarrow-glib-dev libparquet-glib-dev 
@@ -208,7 +208,7 @@ LABEL description="Fluent Bit multi-architecture container image" \
     org.opencontainers.image.source="https://github.com/fluent/fluent-bit" \
     org.opencontainers.image.documentation="https://docs.fluentbit.io/" \
     org.opencontainers.image.authors="Eduardo Silva <eduardo.silva@chronosphere.io>"
-
+    
 # Copy the libraries from the extractor stage into root
 COPY --from=deb-extractor /dpkg /
 
@@ -277,6 +277,18 @@ RUN apt-get update && \
     && apt-get satisfy -y cmake "cmake (<< 4.0)" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        lsb-release \ 
+        wget \
+    &&  wget https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
+    && apt-get install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
+    && rm -rf ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb \
+    && apt-get update && apt-get install -y -V libarrow-glib-dev libparquet-glib-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+    
 
 RUN rm -f /usr/bin/qemu-*-static
 COPY --from=builder /fluent-bit /fluent-bit
