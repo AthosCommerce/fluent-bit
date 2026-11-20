@@ -1,0 +1,154 @@
+# Throwaway test for PR #1 (do not merge). Builds the image and runs the
+# devopsk8s aggregator config against MinIO.
+name: athos-parquet-image-test
+on:
+  push:
+    branches: [yangjeep/parquet-image-test]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (default target, same as a plain docker build)
+        run: docker build -f dockerfiles/Dockerfile -t fb-test .
+
+      - name: Version and parquet support
+        run: |
+          docker run --rm fb-test /fluent-bit/bin/fluent-bit --version
+          docker run --rm fb-test /fluent-bit/bin/fluent-bit -J | python3 -c 'import json,sys; s=json.load(sys.stdin); o=[p for p in s["outputs"] if p["name"]=="s3"][0]; [print(k["name"], "::", k["description"][:200]) for k in o["properties"]["options"] if k["name"] in ("format","compression")]'
+          docker run --rm --entrypoint sh fb-test -c 'ls /usr/lib/*/libparquet-glib* /usr/lib/*/libarrow-glib* && dpkg -l | grep -E "libarrow|libparquet" | head'
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio --network host -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data --address :9000
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+          docker run --rm --network host --entrypoint sh minio/mc -c 'mc alias set m http://127.0.0.1:9000 minioadmin minioadmin && mc mb m/beacon-test'
+
+      - name: Write configs
+        run: |
+          mkdir -p "$RUNNER_TEMP/cfg"
+          # Aggregator: same as devopsk8s keast8-values.yaml, pointed at MinIO,
+          # with short timers, plus a third output using 'format parquet'.
+          cat > "$RUNNER_TEMP/cfg/aggregator.conf" <<'CONF'
+          [SERVICE]
+              Flush     1
+              Log_Level info
+          [INPUT]
+              name forward
+              Listen 0.0.0.0
+              port 24224
+              Buffer_Chunk_Size 1M
+              Buffer_Max_Size   6M
+          [OUTPUT]
+              Name  s3
+              Match *
+              bucket beacon-test
+              region us-east-1
+              endpoint http://127.0.0.1:9000
+              total_file_size 1M
+              upload_timeout 20s
+              compression gzip
+              use_put_object true
+              s3_key_format /$TAG/%Y/%m/%d/%H/%M_%S_$UUID.gz
+          [OUTPUT]
+              Name  s3
+              Match *
+              bucket beacon-test
+              region us-east-1
+              endpoint http://127.0.0.1:9000
+              total_file_size 1M
+              upload_timeout 20s
+              compression parquet
+              use_put_object true
+              s3_key_format /parquet/$TAG/%Y/%m/%d/%H/%M_%S_$UUID.parquet
+          [OUTPUT]
+              Name  s3
+              Match *
+              bucket beacon-test
+              region us-east-1
+              endpoint http://127.0.0.1:9000
+              total_file_size 1M
+              upload_timeout 20s
+              format parquet
+              use_put_object true
+              s3_key_format /format-parquet/$TAG/%Y/%m/%d/%H/%M_%S_$UUID.parquet
+          CONF
+          # Sender: plays the beacon-api sidecar, forwarding synthetic events.
+          cat > "$RUNNER_TEMP/cfg/sender.conf" <<'CONF'
+          [SERVICE]
+              Flush     1
+              Log_Level info
+          [INPUT]
+              Name  dummy
+              Tag   beacon.search_results
+              Rate  5
+              Dummy {"siteId":"abc123","timestamp":"2026-11-20T00:00:00Z","context":{"pageUrl":"https://example.com/s?q=shoes","userAgent":"test"},"data":{"q":"shoes","results":[{"uid":"1","sku":"A"},{"uid":"2","sku":"B"}],"merchandising":{"campaigns":[{"id":"c1","type":"boost"}]},"pagination":{"page":1,"totalResults":2}}}
+          [INPUT]
+              Name  dummy
+              Tag   beacon.search_impression
+              Rate  5
+              Dummy {"siteId":"abc123","timestamp":"2026-11-20T00:00:00Z","context":{"pageUrl":"https://example.com/s?q=hat","userAgent":"test"},"data":{"q":"hat","results":[{"uid":"3","sku":"C"}],"merchandising":{},"pagination":{"page":1,"totalResults":1}}}
+          [INPUT]
+              Name  dummy
+              Tag   beacon.product_pageview
+              Rate  5
+              Dummy {"siteId":"abc123","timestamp":"2026-11-20T00:00:00Z","context":{"pageUrl":"https://example.com/p/1","userAgent":"test"},"data":{"result":{"uid":"1","sku":"A","parentId":"P1"}}}
+          [OUTPUT]
+              Name  forward
+              Match *
+              Host  127.0.0.1
+              Port  24224
+          CONF
+
+      - name: Run aggregator and sender
+        run: |
+          docker run -d --name agg --network host -e AWS_ACCESS_KEY_ID=minioadmin -e AWS_SECRET_ACCESS_KEY=minioadmin \
+            -v "$RUNNER_TEMP/cfg:/cfg:ro" fb-test /fluent-bit/bin/fluent-bit -c /cfg/aggregator.conf
+          sleep 5
+          docker run -d --name sender --network host -v "$RUNNER_TEMP/cfg:/cfg:ro" fb-test /fluent-bit/bin/fluent-bit -c /cfg/sender.conf
+          sleep 60
+          docker stop sender
+          sleep 40
+          docker stop -t 30 agg
+          echo "agg exit code: $(docker inspect agg --format '{{.State.ExitCode}}')"
+
+      - name: Aggregator log (warnings and errors)
+        if: always()
+        run: |
+          docker logs agg > agg.log 2>&1 || true
+          grep -E "warn|error" agg.log | sed -E 's/^\[[^]]*\] //' | sort | uniq -c | sort -rn | head -40
+          echo "--- uploads per output"
+          grep -oE "\[output:s3:s3\.[0-9]\] Successfully uploaded" agg.log | sort | uniq -c
+
+      - name: Inspect uploaded objects
+        if: always()
+        run: |
+          docker run --rm --network host -v "$PWD/out:/out" --entrypoint sh minio/mc -c 'mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null && mc ls -r m/beacon-test && mc cp -r m/beacon-test/ /out/ >/dev/null'
+          sudo chown -R "$(id -u)" out
+          pip install -q pyarrow
+          python3 - <<'PY'
+          import glob, gzip, os, pyarrow.parquet as pq
+          for f in sorted(glob.glob("out/**/*.gz", recursive=True)):
+              with gzip.open(f) as fh:
+                  print("GZ ", os.path.relpath(f, "out"), sum(1 for _ in fh), "lines")
+          for f in sorted(glob.glob("out/**/*.parquet", recursive=True)):
+              pf = pq.ParquetFile(f)
+              codecs = {pf.metadata.row_group(0).column(i).compression for i in range(pf.metadata.num_columns)} if pf.metadata.num_row_groups else set()
+              print("PQ ", os.path.relpath(f, "out"), pf.metadata.num_rows, "rows", "codec=", codecs)
+          seen = set()
+          for f in sorted(glob.glob("out/**/*.parquet", recursive=True)):
+              key = f.split("/")[1] + "/" + f.split("/")[2]
+              if key in seen: continue
+              seen.add(key)
+              print("== schema", key); print(pq.read_schema(f))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-output
+          path: |
+            agg.log
+            out/
