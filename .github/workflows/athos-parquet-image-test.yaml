@@ -1,5 +1,5 @@
 # Throwaway test for PR #1 (do not merge). Builds the image and runs the
-# devopsk8s aggregator config against MinIO.
+# devopsk8s aggregator config against a mock S3 (moto).
 name: athos-parquet-image-test
 on:
   push:
@@ -8,6 +8,10 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
 
@@ -20,16 +24,17 @@ jobs:
           docker run --rm fb-test /fluent-bit/bin/fluent-bit -J | python3 -c 'import json,sys; s=json.load(sys.stdin); o=[p for p in s["outputs"] if p["name"]=="s3"][0]; [print(k["name"], "::", k["description"][:200]) for k in o["properties"]["options"] if k["name"] in ("format","compression")]'
           docker run --rm --entrypoint sh fb-test -c 'ls /usr/lib/*/libparquet-glib* /usr/lib/*/libarrow-glib* && dpkg -l | grep -E "libarrow|libparquet" | head'
 
-      - name: Start MinIO
+      - name: Start mock S3 (moto)
         run: |
-          docker run -d --name minio --network host -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data --address :9000
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
-          docker run --rm --network host --entrypoint sh minio/mc -c 'mc alias set m http://127.0.0.1:9000 minioadmin minioadmin && mc mb m/beacon-test'
+          pip install -q 'moto[server]'
+          nohup moto_server -H 127.0.0.1 -p 9000 > moto.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9000/ >/dev/null && break; sleep 1; done
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://beacon-test
 
       - name: Write configs
         run: |
           mkdir -p "$RUNNER_TEMP/cfg"
-          # Aggregator: same as devopsk8s keast8-values.yaml, pointed at MinIO,
+          # Aggregator: same as devopsk8s keast8-values.yaml, pointed at the mock S3,
           # with short timers, plus a third output using 'format parquet'.
           cat > "$RUNNER_TEMP/cfg/aggregator.conf" <<'CONF'
           [SERVICE]
@@ -104,7 +109,7 @@ jobs:
 
       - name: Run aggregator and sender
         run: |
-          docker run -d --name agg --network host -e AWS_ACCESS_KEY_ID=minioadmin -e AWS_SECRET_ACCESS_KEY=minioadmin \
+          docker run -d --name agg --network host -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
             -v "$RUNNER_TEMP/cfg:/cfg:ro" fb-test /fluent-bit/bin/fluent-bit -c /cfg/aggregator.conf
           sleep 5
           docker run -d --name sender --network host -v "$RUNNER_TEMP/cfg:/cfg:ro" fb-test /fluent-bit/bin/fluent-bit -c /cfg/sender.conf
@@ -125,8 +130,8 @@ jobs:
       - name: Inspect uploaded objects
         if: always()
         run: |
-          docker run --rm --network host -v "$PWD/out:/out" --entrypoint sh minio/mc -c 'mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null && mc ls -r m/beacon-test && mc cp -r m/beacon-test/ /out/ >/dev/null'
-          sudo chown -R "$(id -u)" out
+          aws --endpoint-url http://127.0.0.1:9000 s3 ls --recursive s3://beacon-test/
+          aws --endpoint-url http://127.0.0.1:9000 s3 cp --recursive --quiet s3://beacon-test/ out/
           pip install -q pyarrow
           python3 - <<'PY'
           import glob, gzip, os, pyarrow.parquet as pq
