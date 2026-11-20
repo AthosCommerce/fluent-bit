@@ -42,6 +42,7 @@ struct flb_oauth2_config {
     flb_sds_t token_url;
     flb_sds_t client_id;
     flb_sds_t client_secret;
+    flb_sds_t user_agent;
     flb_sds_t scope;
     flb_sds_t audience;
     flb_sds_t resource;
@@ -92,10 +93,12 @@ struct flb_oauth2 {
     struct flb_upstream *u;
 };
 
-struct flb_oauth2 *flb_oauth2_create(struct flb_config *config,
+struct flb_output_instance;
+
+struct flb_oauth2 *flb_oauth2_create(struct flb_output_instance *ins,
                                      const char *auth_url, int expire_sec);
 struct flb_oauth2 *flb_oauth2_create_from_config(
-                                struct flb_config *config,
+                                struct flb_output_instance *ins,
                                 const struct flb_oauth2_config *cfg);
 void flb_oauth2_destroy(struct flb_oauth2 *ctx);
 void flb_oauth2_config_destroy(struct flb_oauth2_config *cfg);

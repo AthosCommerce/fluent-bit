@@ -73,6 +73,10 @@ static int get_write_op(struct flb_in_elasticsearch *ctx, msgpack_object *map, f
     msgpack_object key;
     int check = FLB_FALSE;
 
+    if (map->via.map.size == 0) {
+        return FLB_FALSE;
+    }
+
     kv = map->via.map.ptr;
     key = kv[0].key;
     if (key.type == MSGPACK_OBJECT_BIN) {
@@ -105,7 +109,32 @@ static int status_buffer_avail(struct flb_in_elasticsearch *ctx, flb_sds_t bulk_
     return FLB_TRUE;
 }
 
-static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char *buf, size_t size, flb_sds_t bulk_statuses)
+static int bulk_statuses_cat(struct flb_in_elasticsearch *ctx,
+                             flb_sds_t *bulk_statuses,
+                             const char *data, size_t len)
+{
+    flb_sds_t tmp;
+
+    if (flb_sds_avail(*bulk_statuses) < len) {
+        flb_plg_warn(ctx->ins, "left buffer for bulk status(es) is too small");
+
+        return FLB_FALSE;
+    }
+
+    tmp = flb_sds_cat(*bulk_statuses, data, len);
+    if (!tmp) {
+        flb_errno();
+
+        return FLB_FALSE;
+    }
+
+    *bulk_statuses = tmp;
+
+    return FLB_TRUE;
+}
+
+static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char *buf,
+                          size_t size, flb_sds_t *bulk_statuses)
 {
     struct flb_log_event_encoder *encoder;
     struct flb_log_event_encoder local_encoder;
@@ -146,9 +175,15 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
     while (msgpack_unpack_next(&result, buf, size, &off) == MSGPACK_UNPACK_SUCCESS) {
         if (result.data.type == MSGPACK_OBJECT_MAP) {
             if (idx > 0 && idx % 2 == 0) {
-                flb_sds_cat(bulk_statuses, ",", 1);
+                if (status_buffer_avail(ctx, *bulk_statuses, 51) == FLB_FALSE) {
+                    break;
+                }
+
+                if (bulk_statuses_cat(ctx, bulk_statuses, ",", 1) == FLB_FALSE) {
+                    break;
+                }
             }
-            if (status_buffer_avail(ctx, bulk_statuses, 50) == FLB_FALSE) {
+            else if (status_buffer_avail(ctx, *bulk_statuses, 50) == FLB_FALSE) {
                 break;
             }
             if (idx % 2 == 0) {
@@ -156,37 +191,67 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
 
                 if (op_ret) {
                     if (flb_sds_cmp(write_op, "index", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"index\":", 9);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"index\":", 9) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+                            break;
+                        }
                         error_op = FLB_FALSE;
                     }
                     else if (flb_sds_cmp(write_op, "create", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"create\":", 10);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"create\":", 10) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+                            break;
+                        }
                         error_op = FLB_FALSE;
                     }
                     else if (flb_sds_cmp(write_op, "update", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"update\":", 10);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"update\":", 10) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+                            break;
+                        }
                         error_op = FLB_TRUE;
                     }
                     else if (flb_sds_cmp(write_op, "delete", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"delete\":{\"status\":404,\"result\":\"not_found\"}}", 46);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"delete\":{\"status\":404,\"result\":\"not_found\"}}",
+                                              46) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+                            break;
+                        }
                         error_op = FLB_TRUE;
                         idx += 1; /* Prepare to adjust to multiple of two
                                    * in the end of the loop.
                                    * Due to delete actions include only one line. */
                         flb_sds_destroy(write_op);
+                        write_op = NULL;
 
                         goto proceed;
                     }
                     else {
-                        flb_sds_cat(bulk_statuses, "{\"unknown\":{\"status\":400,\"result\":\"bad_request\"}}", 49);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"unknown\":{\"status\":400,\"result\":\"bad_request\"}}",
+                                              49) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+                            break;
+                        }
                         error_op = FLB_TRUE;
 
                         flb_sds_destroy(write_op);
+                        write_op = NULL;
 
                         break;
                     }
                 } else {
                     flb_sds_destroy(write_op);
+                    write_op = NULL;
                     flb_plg_error(ctx->ins, "meta information line is missing");
                     error_op = FLB_TRUE;
 
@@ -199,10 +264,11 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                     ret = flb_log_event_encoder_begin_record(encoder);
 
                     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
-                        flb_sds_destroy(write_op);
                         flb_plg_error(ctx->ins, "event encoder error : %d", ret);
                         error_op = FLB_TRUE;
-
+                        ingest_result = -1;
+                        flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
 
@@ -211,10 +277,11 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                             &tm);
 
                     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
-                        flb_sds_destroy(write_op);
                         flb_plg_error(ctx->ins, "event encoder error : %d", ret);
                         error_op = FLB_TRUE;
-
+                        ingest_result = -1;
+                        flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
 
@@ -226,10 +293,11 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                     }
 
                     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
-                        flb_sds_destroy(write_op);
                         flb_plg_error(ctx->ins, "event encoder error : %d", ret);
                         error_op = FLB_TRUE;
-
+                        ingest_result = -1;
+                        flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
                 }
@@ -253,7 +321,9 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
                         flb_plg_error(ctx->ins, "event encoder error : %d", ret);
                         error_op = FLB_TRUE;
-
+                        ingest_result = -1;
+                        flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
 
@@ -262,7 +332,9 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
                         flb_plg_error(ctx->ins, "event encoder error : %d", ret);
                         error_op = FLB_TRUE;
-
+                        ingest_result = -1;
+                        flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
 
@@ -308,6 +380,7 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
 
                         error_op = FLB_TRUE;
                         flb_sds_destroy(write_op);
+                        write_op = NULL;
                         break;
                     }
 
@@ -315,15 +388,36 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
                 }
                 if (op_ret) {
                     if (flb_sds_cmp(write_op, "index", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"status\":201,\"result\":\"created\"}}", 34);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"status\":201,\"result\":\"created\"}}",
+                                              34) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+
+                            break;
+                        }
                     }
                     else if (flb_sds_cmp(write_op, "create", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"status\":201,\"result\":\"created\"}}", 34);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"status\":201,\"result\":\"created\"}}",
+                                              34) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+
+                            break;
+                        }
                     }
                     else if (flb_sds_cmp(write_op, "update", op_str_size) == 0) {
-                        flb_sds_cat(bulk_statuses, "{\"status\":403,\"result\":\"forbidden\"}}", 36);
+                        if (bulk_statuses_cat(ctx, bulk_statuses,
+                                              "{\"status\":403,\"result\":\"forbidden\"}}",
+                                              36) == FLB_FALSE) {
+                            flb_sds_destroy(write_op);
+                            write_op = NULL;
+
+                            break;
+                        }
                     }
-                    if (status_buffer_avail(ctx, bulk_statuses, 50) == FLB_FALSE) {
+                    if (status_buffer_avail(ctx, *bulk_statuses, 50) == FLB_FALSE) {
                         flb_sds_destroy(write_op);
                         write_op = NULL;
 
@@ -340,40 +434,40 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
         else {
             flb_plg_error(ctx->ins, "skip record from invalid type: %i",
                          result.data.type);
+            flb_sds_destroy(write_op);
+            write_op = NULL;
             msgpack_unpacked_destroy(&result);
             if (destroy_local_encoder == FLB_TRUE) {
                 flb_log_event_encoder_destroy(encoder);
             }
-            return -1;
+            return FLB_ERR_JSON_INVAL;
         }
+    }
+
+    /* Release the pending action name, if any, on every exit path. */
+    flb_sds_destroy(write_op);
+    write_op = NULL;
+
+    if (ingest_result != 0) {
+        msgpack_unpacked_destroy(&result);
+        if (destroy_local_encoder == FLB_TRUE) {
+            flb_log_event_encoder_destroy(encoder);
+        }
+        return ingest_result;
     }
 
     if (idx % 2 != 0) {
         flb_plg_warn(ctx->ins, "decode payload of Bulk API is failed");
         msgpack_unpacked_destroy(&result);
-        if (error_op == FLB_FALSE && write_op != NULL) {
-            /* On lacking of body case in non-error case, there is no
-             * releasing memory code paths. We should proceed to do
-             * it here. */
-            flb_sds_destroy(write_op);
-        }
 
         if (destroy_local_encoder == FLB_TRUE) {
             flb_log_event_encoder_destroy(encoder);
         }
 
-        return -1;
+        return FLB_ERR_JSON_INVAL;
     }
 
     msgpack_unpacked_destroy(&result);
-
-    if (ingest_result != 0) {
-        if (destroy_local_encoder == FLB_TRUE) {
-            flb_log_event_encoder_destroy(encoder);
-        }
-
-        return ingest_result;
-    }
 
     if (destroy_local_encoder == FLB_TRUE) {
         flb_log_event_encoder_destroy(encoder);
@@ -383,29 +477,44 @@ static int process_ndpack(struct flb_in_elasticsearch *ctx, flb_sds_t tag, char 
 }
 
 static ssize_t parse_payload_ndjson(struct flb_in_elasticsearch *ctx, flb_sds_t tag,
-                                    char *payload, size_t size, flb_sds_t bulk_statuses)
+                                    char *payload, size_t size, flb_sds_t *bulk_statuses)
 {
     int ret;
     int out_size;
+    size_t offset;
     char *pack;
     struct flb_pack_state pack_state;
 
     /* Initialize packer */
-    flb_pack_state_init(&pack_state);
+    ret = flb_pack_state_init(&pack_state);
+    if (ret != 0) {
+        return -1;
+    }
 
     /* Pack JSON as msgpack */
     ret = flb_pack_json_state(payload, size,
                               &pack, &out_size, &pack_state);
+    if (ret == 0) {
+        /* The packer can succeed with a complete prefix of an incomplete request. */
+        for (offset = pack_state.last_byte; offset < size; offset++) {
+            if (payload[offset] != ' ' && payload[offset] != '\t' &&
+                payload[offset] != '\r' && payload[offset] != '\n') {
+                flb_free(pack);
+                ret = FLB_ERR_JSON_INVAL;
+                break;
+            }
+        }
+    }
     flb_pack_state_reset(&pack_state);
 
     /* Handle exceptions */
     if (ret == FLB_ERR_JSON_PART) {
         flb_plg_warn(ctx->ins, "JSON data is incomplete, skipping");
-        return -1;
+        return FLB_ERR_JSON_INVAL;
     }
     else if (ret == FLB_ERR_JSON_INVAL) {
         flb_plg_warn(ctx->ins, "invalid JSON message, skipping");
-        return -1;
+        return FLB_ERR_JSON_INVAL;
     }
     else if (ret == -1) {
         return -1;
@@ -529,8 +638,10 @@ static int process_payload_ng(struct flb_http_request *request,
                               struct flb_http_response *response,
                               struct flb_in_elasticsearch *context,
                               flb_sds_t tag,
-                              flb_sds_t bulk_statuses)
+                              flb_sds_t *bulk_statuses)
 {
+    int ret;
+
     if (request->content_type == NULL) {
         send_response_ng(response, 400, NULL, "error: header 'Content-Type' is not set\n");
 
@@ -549,8 +660,16 @@ static int process_payload_ng(struct flb_http_request *request,
         return -1;
     }
 
-    return parse_payload_ndjson(context, tag, request->body,
-                                cfl_sds_len(request->body), bulk_statuses);
+    ret = parse_payload_ndjson(context, tag, request->body,
+                               cfl_sds_len(request->body), bulk_statuses);
+    if (ret == FLB_ERR_JSON_INVAL) {
+        send_response_ng(response, 400, NULL, "error: invalid bulk payload\n");
+    }
+    else if (ret != 0 && ret != FLB_INPUT_INGRESS_BUSY) {
+        send_response_ng(response, 500, NULL, "error: could not ingest bulk payload\n");
+    }
+
+    return ret;
 }
 
 int in_elasticsearch_bulk_prot_handle_ng(struct flb_http_request *request,
@@ -563,13 +682,14 @@ int in_elasticsearch_bulk_prot_handle_ng(struct flb_http_request *request,
     int                          result;
     flb_sds_t                    tag;
     size_t                       len;
+    flb_sds_t                    tmp;
 
     bulk_statuses = NULL;
     bulk_response = NULL;
 
     context = (struct flb_in_elasticsearch *) response->stream->user_data;
 
-    if (request->path[0] != '/') {
+    if (request->path == NULL || request->path[0] != '/') {
         send_response_ng(response, 400, NULL, "error: invalid request\n");
         return -1;
     }
@@ -627,7 +747,7 @@ int in_elasticsearch_bulk_prot_handle_ng(struct flb_http_request *request,
                 return -1;
             }
 
-            result = process_payload_ng(request, response, context, tag, bulk_statuses);
+            result = process_payload_ng(request, response, context, tag, &bulk_statuses);
 
             flb_sds_destroy(tag);
 
@@ -647,20 +767,49 @@ int in_elasticsearch_bulk_prot_handle_ng(struct flb_http_request *request,
             len = flb_sds_len(bulk_statuses);
 
             if (flb_sds_alloc(bulk_response) < len + 27) {
-                bulk_response = flb_sds_increase(bulk_response, len + 27 - flb_sds_alloc(bulk_response));
+                tmp = flb_sds_increase(bulk_response, len + 27 - flb_sds_alloc(bulk_response));
+
+                if (tmp == NULL) {
+                    flb_sds_destroy(bulk_statuses);
+                    flb_sds_destroy(bulk_response);
+                    return -1;
+                }
+
+                bulk_response = tmp;
             }
 
             error_str = strstr(bulk_statuses, "\"status\":40");
 
             if (error_str){
-                flb_sds_cat(bulk_response, "{\"errors\":true,\"items\":[", 24);
+                tmp = flb_sds_cat(bulk_response, "{\"errors\":true,\"items\":[", 24);
             }
             else {
-                flb_sds_cat(bulk_response, "{\"errors\":false,\"items\":[", 25);
+                tmp = flb_sds_cat(bulk_response, "{\"errors\":false,\"items\":[", 25);
             }
 
-            flb_sds_cat(bulk_response, bulk_statuses, flb_sds_len(bulk_statuses));
-            flb_sds_cat(bulk_response, "]}", 2);
+            if (tmp == NULL) {
+                flb_sds_destroy(bulk_statuses);
+                flb_sds_destroy(bulk_response);
+                return -1;
+            }
+
+            bulk_response = tmp;
+
+            tmp = flb_sds_cat(bulk_response, bulk_statuses, flb_sds_len(bulk_statuses));
+            if (tmp == NULL) {
+                flb_sds_destroy(bulk_statuses);
+                flb_sds_destroy(bulk_response);
+                return -1;
+            }
+            bulk_response = tmp;
+
+            tmp = flb_sds_cat(bulk_response, "]}", 2);
+            if (tmp == NULL) {
+                flb_sds_destroy(bulk_statuses);
+                flb_sds_destroy(bulk_response);
+                return -1;
+            }
+            bulk_response = tmp;
 
             send_json_response_ng(response, 200, bulk_response);
 

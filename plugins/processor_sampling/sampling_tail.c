@@ -847,7 +847,7 @@ static int cb_init(struct flb_config *config, struct sampling *ctx)
         return -1;
     }
 
-    ret = flb_config_map_set(&ctx->plugin_settings_properties, ctx->plugin_config_map, (void *) settings);
+    ret = flb_config_map_set(config, &ctx->plugin_settings_properties, ctx->plugin_config_map, (void *) settings);
     if (ret == -1) {
         flb_free(settings);
         return -1;
@@ -894,6 +894,8 @@ static int cb_do_sampling(struct sampling *ctx, void *plugin_context,
     ctrace_entry = flb_malloc(sizeof(struct sampling_ctrace_entry));
     if (!ctrace_entry) {
         flb_errno();
+        /* the caller destroys the context, unregister its spans */
+        sampling_span_registry_remove_trace(ctx, settings->span_reg, in_ctr);
         return FLB_PROCESSOR_FAILURE;
     }
     ctrace_entry->ctr = in_ctr;

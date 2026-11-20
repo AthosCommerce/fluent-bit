@@ -288,7 +288,8 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
     }
 
     if (ins->oauth2_config_map && mk_list_size(&ins->oauth2_properties) > 0) {
-        ret = flb_config_map_set(&ins->oauth2_properties,
+        ret = flb_config_map_set(ins->config,
+                                 &ins->oauth2_properties,
                                  ins->oauth2_config_map,
                                  &ctx->oauth2_config);
         if (ret == -1) {
@@ -454,7 +455,7 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
             return NULL;
         }
 
-        ctx->oauth2_ctx = flb_oauth2_create_from_config(config, &ctx->oauth2_config);
+        ctx->oauth2_ctx = flb_oauth2_create_from_config(ins, &ctx->oauth2_config);
         if (!ctx->oauth2_ctx) {
             flb_plg_error(ctx->ins, "failed to initialize oauth2 context");
             flb_opentelemetry_context_destroy(ctx);
@@ -750,6 +751,14 @@ struct opentelemetry_context *flb_opentelemetry_context_create(struct flb_output
                                   http_protocol_version,
                                   http_client_flags);
 
+    if (ret == 0) {
+        ctx->http_client.max_response_size = config->http_client_max_response_size;
+        ctx->http_client.max_header_size = config->http_client_max_header_size;
+        ctx->http_client.max_wire_size = config->http_client_max_wire_size;
+        ctx->http_client.max_header_count = config->http_client_max_header_count;
+        ctx->http_client.response_timeout = config->http_client_response_timeout;
+    }
+
     if (ret != 0) {
         flb_plg_debug(ctx->ins, "http client creation error");
 
@@ -905,7 +914,11 @@ void flb_opentelemetry_context_destroy(struct opentelemetry_context *ctx)
     if (ctx->oauth2_ctx) {
         flb_oauth2_destroy(ctx->oauth2_ctx);
     }
-    flb_oauth2_config_destroy(&ctx->oauth2_config);
+    /*
+     * ctx->oauth2_config strings are populated through the output config map,
+     * so flb_config_map_destroy() owns their release. The OAuth2 runtime
+     * context clones the strings it needs.
+     */
 
     flb_free(ctx->proxy_host);
     flb_free(ctx);

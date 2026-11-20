@@ -17,8 +17,10 @@
  *  limitations under the License.
  */
 
+#include "cmt_protobuf.h"
 #include <cmetrics/cmetrics.h>
 #include <cmetrics/cmt_metric.h>
+#include <cmetrics/cmt_otlp_metadata.h>
 #include <cmetrics/cmt_map.h>
 #include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_counter.h>
@@ -32,8 +34,15 @@
 
 #include <math.h>
 #include <inttypes.h>
+#include <stdint.h>
+#include <limits.h>
+#include <string.h>
 
-static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyValue *source);
+/* Distinguish absent optional values from allocation failures. */
+#define CLONE_UNSUPPORTED_VALUE -1
+
+static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyValue *source,
+                                          int *status);
 
 static int clone_array(struct cfl_array *target,
                        Opentelemetry__Proto__Common__V1__ArrayValue *source);
@@ -58,14 +67,18 @@ static int clone_exemplars_to_kvlist(struct cfl_kvlist *target,
                                      Opentelemetry__Proto__Metrics__V1__Exemplar **exemplars,
                                      size_t exemplar_count);
 
-static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyValue *source)
+static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyValue *source,
+                                          int *status)
 {
     struct cfl_kvlist  *new_child_kvlist;
     struct cfl_array   *new_child_array;
     struct cfl_variant *result_instance = NULL;
     int                 result;
 
-    if (source == NULL) {
+    *status = CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+    if (source == NULL || source->value_case ==
+        OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE__NOT_SET) {
+        *status = CLONE_UNSUPPORTED_VALUE;
         return NULL;
     }
     if (source->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE) {
@@ -100,6 +113,7 @@ static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyVa
         result = clone_kvlist(new_child_kvlist, source->kvlist_value);
         if (result) {
             cfl_variant_destroy(result_instance);
+            *status = result;
 
             return NULL;
         }
@@ -121,6 +135,7 @@ static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyVa
         result = clone_array(new_child_array, source->array_value);
         if (result) {
             cfl_variant_destroy(result_instance);
+            *status = result;
 
             return NULL;
         }
@@ -128,6 +143,13 @@ static struct cfl_variant *clone_variant(Opentelemetry__Proto__Common__V1__AnyVa
     else if (source->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BYTES_VALUE) {
         result_instance = cfl_variant_create_from_bytes((char *) source->bytes_value.data, source->bytes_value.len,
                                                         CFL_FALSE);
+    }
+    else {
+        *status = CLONE_UNSUPPORTED_VALUE;
+    }
+
+    if (result_instance != NULL) {
+        *status = CMT_DECODE_OPENTELEMETRY_SUCCESS;
     }
 
     return result_instance;
@@ -162,9 +184,9 @@ static int clone_array_entry(struct cfl_array *target,
         return CMT_DECODE_OPENTELEMETRY_SUCCESS;
     }
 
-    new_child_instance = clone_variant(source);
+    new_child_instance = clone_variant(source, &result);
     if (new_child_instance == NULL) {
-        return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        return result;
     }
 
     result = cfl_array_append(target, new_child_instance);
@@ -209,10 +231,10 @@ static int clone_kvlist_entry(struct cfl_kvlist *target,
         return CMT_DECODE_OPENTELEMETRY_SUCCESS;
     }
 
-    new_child_instance = clone_variant(source->value);
+    new_child_instance = clone_variant(source->value, &result);
 
     if (new_child_instance == NULL) {
-        return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        return result;
     }
 
     result = cfl_kvlist_insert(target, source->key, new_child_instance);
@@ -267,7 +289,7 @@ static struct cmt_map_label *create_label(char *caption, size_t length)
 
     if (instance != NULL) {
         if (caption != NULL) {
-            if (length == 0) {
+            if (length == (size_t) -1) {
                 length = strlen(caption);
             }
 
@@ -315,7 +337,8 @@ static uint64_t compute_metric_hash(struct cmt_map *map, struct cmt_metric *samp
     struct cmt_map_label *label_value;
     cfl_hash_state_t state;
 
-    if (sample == NULL || map == NULL) {
+    if (sample == NULL || map == NULL ||
+        map->opts == NULL || map->opts->fqname == NULL) {
         return 0;
     }
 
@@ -328,58 +351,21 @@ static uint64_t compute_metric_hash(struct cmt_map *map, struct cmt_metric *samp
 
     cfl_list_foreach(head, &sample->labels) {
         label_value = cfl_list_entry(head, struct cmt_map_label, _head);
+        if (label_value->name == NULL) {
+            continue;
+        }
         cfl_hash_64bits_update(&state, label_value->name, cfl_sds_len(label_value->name));
     }
 
     return cfl_hash_64bits_digest(&state);
 }
 
-static char *map_type_to_key(int map_type)
-{
-    switch (map_type) {
-    case CMT_COUNTER:
-        return "counter";
-    case CMT_GAUGE:
-        return "gauge";
-    case CMT_UNTYPED:
-        return "untyped";
-    case CMT_SUMMARY:
-        return "summary";
-    case CMT_HISTOGRAM:
-        return "histogram";
-    case CMT_EXP_HISTOGRAM:
-        return "exp_histogram";
-    default:
-        return "unknown";
-    }
-}
-
 static struct cfl_kvlist *get_or_create_metric_metadata_context(struct cmt *cmt, struct cmt_map *map)
 {
-    struct cfl_kvlist *otlp_root;
-    struct cfl_kvlist *metrics_root;
-    struct cfl_kvlist *type_root;
-
-    if (cmt == NULL || map == NULL || map->opts == NULL || map->opts->fqname == NULL) {
-        return NULL;
+    if (!map->otlp_metadata) {
+        map->otlp_metadata = cfl_kvlist_create();
     }
-
-    otlp_root = get_or_create_external_metadata_kvlist(cmt->external_metadata, "otlp");
-    if (otlp_root == NULL) {
-        return NULL;
-    }
-
-    metrics_root = get_or_create_external_metadata_kvlist(otlp_root, "metrics");
-    if (metrics_root == NULL) {
-        return NULL;
-    }
-
-    type_root = get_or_create_external_metadata_kvlist(metrics_root, map_type_to_key(map->type));
-    if (type_root == NULL) {
-        return NULL;
-    }
-
-    return get_or_create_external_metadata_kvlist(type_root, map->opts->fqname);
+    return map->otlp_metadata;
 }
 
 static struct cfl_kvlist *get_or_create_data_point_metadata_context(struct cmt *cmt,
@@ -387,28 +373,58 @@ static struct cfl_kvlist *get_or_create_data_point_metadata_context(struct cmt *
                                                                      struct cmt_metric *sample,
                                                                      uint64_t timestamp)
 {
-    char key[128];
-    struct cfl_kvlist *metric_context;
-    struct cfl_kvlist *datapoints_context;
-
-    if (sample != NULL && sample->hash == 0 && cfl_list_size(&sample->labels) > 0) {
+    if (sample == NULL) {
+        return NULL;
+    }
+    if (sample->hash == 0 && cfl_list_size(&sample->labels) > 0) {
         sample->hash = compute_metric_hash(map, sample);
     }
-
-    metric_context = get_or_create_metric_metadata_context(cmt, map);
-    if (metric_context == NULL) {
-        return NULL;
+    if (sample->otlp_metadata == NULL) {
+        sample->otlp_metadata = cfl_kvlist_create();
+        if (sample->otlp_metadata && cmt_otlp_capture_labels(map, sample) != 0) {
+            return NULL;
+        }
     }
+    return sample->otlp_metadata;
+}
 
-    datapoints_context = get_or_create_external_metadata_kvlist(metric_context, "datapoints");
-    if (datapoints_context == NULL) {
-        return NULL;
+/* Keep telemetry attributes typed; string labels remain available to native exporters. */
+static int clone_point_attributes(struct cfl_kvlist *metadata,
+                                  Opentelemetry__Proto__Common__V1__KeyValue **attributes,
+                                  size_t count)
+{
+    struct cfl_kvlist *copy;
+    size_t index;
+    int result;
+
+    copy = cfl_kvlist_create();
+    if (copy == NULL) {
+        return -1;
     }
-
-    snprintf(key, sizeof(key) - 1, "%" PRIx64 ":%" PRIu64,
-             sample != NULL ? sample->hash : 0, timestamp);
-
-    return get_or_create_external_metadata_kvlist(datapoints_context, key);
+    for (index = 0; index < count; index++) {
+        if (attributes[index] != NULL &&
+            (attributes[index]->value == NULL ||
+             attributes[index]->value->value_case ==
+             OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE__NOT_SET)) {
+            continue;
+        }
+        result = clone_kvlist_entry(copy, attributes[index]);
+        if (result == CLONE_UNSUPPORTED_VALUE) {
+            /* A partial typed tree would change the attributes. Retain the
+             * label-derived representation when any nested value is absent. */
+            cfl_kvlist_destroy(copy);
+            return 0;
+        }
+        if (attributes[index] == NULL || result != 0) {
+            cfl_kvlist_destroy(copy);
+            return -1;
+        }
+    }
+    if (cfl_kvlist_insert_kvlist(metadata, "attributes", copy) != 0) {
+        cfl_kvlist_destroy(copy);
+        return -1;
+    }
+    return 0;
 }
 
 static int clone_exemplars_to_kvlist(struct cfl_kvlist *target,
@@ -532,7 +548,7 @@ static int append_new_map_label_key(struct cmt_map *map, char *name)
 {
     struct cmt_map_label *label;
 
-    label = create_label(name, 0);
+    label = create_label(name, (size_t) -1);
 
     if (label == NULL) {
         return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
@@ -567,6 +583,7 @@ static int decode_data_point_labels(struct cmt *cmt,
 {
     char                                        dummy_label_value[32];
     void                                      **value_index_list;
+    size_t                                      alloc_count;
     size_t                                      attribute_index;
     size_t                                      map_label_index;
     size_t                                      map_label_count;
@@ -583,11 +600,17 @@ static int decode_data_point_labels(struct cmt *cmt,
         return result;
     }
 
-    if (attribute_count > 127) {
+    if (attribute_list == NULL) {
         return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
     }
 
-    value_index_list = calloc(128, sizeof(void *));
+    map_label_count = cfl_list_size(&map->label_keys);
+    if (attribute_count > SIZE_MAX - map_label_count) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    alloc_count = map_label_count + attribute_count;
+    value_index_list = calloc(alloc_count, sizeof(void *));
 
     if (value_index_list == NULL) {
         return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
@@ -599,6 +622,10 @@ static int decode_data_point_labels(struct cmt *cmt,
          attribute_index++) {
 
         attribute = attribute_list[attribute_index];
+        if (attribute == NULL || attribute->key == NULL || attribute->key[0] == '\0') {
+            result = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            break;
+        }
 
         label_found = CMT_FALSE;
         label_index = 0;
@@ -606,7 +633,8 @@ static int decode_data_point_labels(struct cmt *cmt,
         cfl_list_foreach(label_iterator, &map->label_keys) {
             current_label = cfl_list_entry(label_iterator, struct cmt_map_label, _head);
 
-            if (strcmp(current_label->name, attribute->key) == 0) {
+            if (current_label->name != NULL &&
+                strcmp(current_label->name, attribute->key) == 0) {
                 label_found = CMT_TRUE;
 
                 break;
@@ -620,6 +648,11 @@ static int decode_data_point_labels(struct cmt *cmt,
         }
 
         if (result == CMT_DECODE_OPENTELEMETRY_SUCCESS) {
+            if (label_index >= alloc_count) {
+                result = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+                break;
+            }
+
             value_index_list[label_index] = (void *) attribute;
         }
     }
@@ -631,50 +664,97 @@ static int decode_data_point_labels(struct cmt *cmt,
          map_label_index < map_label_count ;
          map_label_index++) {
 
+        if (map_label_index >= alloc_count) {
+            result = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            break;
+        }
+
         if (value_index_list[map_label_index] != NULL) {
             attribute = (Opentelemetry__Proto__Common__V1__KeyValue *)
                             value_index_list[map_label_index];
 
             if (attribute->value == NULL) {
+                result = append_new_metric_label_value(metric, NULL, 0);
                 continue;
             }
 
             if (attribute->value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE) {
-                result = append_new_metric_label_value(metric, attribute->value->string_value, 0);
+                if (attribute->value->string_value == NULL) {
+                    result = append_new_metric_label_value(metric, NULL, 0);
+                }
+                else {
+                    result = append_new_metric_label_value(metric,
+                                                           attribute->value->string_value,
+                                                           (size_t) -1);
+                }
             }
             else if (attribute->value->value_case ==
                      OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE_STRINDEX) {
-                result = append_new_metric_label_value(metric, "", 0);
+                result = append_new_metric_label_value(metric, NULL, 0);
             }
             else if (attribute->value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BYTES_VALUE) {
-                result = append_new_metric_label_value(metric,
-                                                       (char *) attribute->value->bytes_value.data,
-                                                       attribute->value->bytes_value.len);
+                if (attribute->value->bytes_value.data == NULL &&
+                    attribute->value->bytes_value.len > 0) {
+                    result = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+                }
+                else {
+                    result = append_new_metric_label_value(metric,
+                                                           attribute->value->bytes_value.data != NULL ?
+                                                           (char *) attribute->value->bytes_value.data : "",
+                                                           attribute->value->bytes_value.len);
+                }
             }
             else if (attribute->value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BOOL_VALUE) {
                 snprintf(dummy_label_value, sizeof(dummy_label_value) - 1, "%d", attribute->value->bool_value);
 
-                result = append_new_metric_label_value(metric, dummy_label_value, 0);
+                result = append_new_metric_label_value(metric, dummy_label_value, (size_t) -1);
             }
             else if (attribute->value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_INT_VALUE) {
                 snprintf(dummy_label_value, sizeof(dummy_label_value) - 1, "%" PRIi64, attribute->value->int_value);
 
-                result = append_new_metric_label_value(metric, dummy_label_value, 0);
+                result = append_new_metric_label_value(metric, dummy_label_value, (size_t) -1);
             }
             else if (attribute->value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_DOUBLE_VALUE) {
                 snprintf(dummy_label_value, sizeof(dummy_label_value) - 1, "%.17g", attribute->value->double_value);
 
-                result = append_new_metric_label_value(metric, dummy_label_value, 0);
+                result = append_new_metric_label_value(metric, dummy_label_value, (size_t) -1);
             }
             else {
                 result = append_new_metric_label_value(metric, NULL, 0);
             }
+        }
+        else {
+            result = append_new_metric_label_value(metric, NULL, 0);
         }
     }
 
     free(value_index_list);
 
     return result;
+}
+
+/* A repeated label-less point replaces the static sample's previous point. */
+static void reset_static_data_point(struct cmt_map *map)
+{
+    struct cmt_metric *metric;
+    struct cmt_histogram *histogram;
+
+    metric = &map->metric;
+
+    if (metric->otlp_metadata != NULL) {
+        cfl_kvlist_destroy(metric->otlp_metadata);
+        metric->otlp_metadata = NULL;
+    }
+
+    if (map->type == CMT_HISTOGRAM && metric->hist_buckets != NULL) {
+        histogram = (struct cmt_histogram *) map->parent;
+        memset(metric->hist_buckets, 0,
+               sizeof(uint64_t) * (histogram->buckets->count + 1));
+    }
+    else if (map->type == CMT_SUMMARY && metric->sum_quantiles != NULL) {
+        memset(metric->sum_quantiles, 0,
+               sizeof(uint64_t) * metric->sum_quantiles_count);
+    }
 }
 
 static int decode_numerical_data_point(struct cmt *cmt,
@@ -690,9 +770,9 @@ static int decode_numerical_data_point(struct cmt *cmt,
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
     if (data_point->n_attributes == 0) {
-        if (map->metric_static_set == CMT_FALSE) {
-            static_metric_detected = CMT_TRUE;
-        }
+        /* Label-less points always target the static sample, the last
+         * one wins, as released versions behave. */
+        static_metric_detected = CMT_TRUE;
     }
 
     if (static_metric_detected == CMT_FALSE) {
@@ -721,7 +801,9 @@ static int decode_numerical_data_point(struct cmt *cmt,
     }
     else {
         sample = &map->metric;
-
+        if (map->metric_static_set) {
+            reset_static_data_point(map);
+        }
         map->metric_static_set = CMT_TRUE;
     }
 
@@ -752,6 +834,10 @@ static int decode_numerical_data_point(struct cmt *cmt,
         }
 
         point_metadata = get_or_create_data_point_metadata_context(cmt, map, sample, data_point->time_unix_nano);
+        if (point_metadata == NULL || clone_point_attributes(point_metadata, data_point->attributes,
+                                                            data_point->n_attributes) != 0) {
+            return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        }
         if (point_metadata != NULL) {
             cfl_kvlist_insert_uint64(point_metadata, "start_time_unix_nano", data_point->start_time_unix_nano);
             cfl_kvlist_insert_uint64(point_metadata, "flags", data_point->flags);
@@ -785,9 +871,17 @@ static int decode_numerical_data_point_list(struct cmt *cmt,
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (data_point_count > 0 && data_point_list == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     for (index = 0 ;
          result == 0 &&
          index < data_point_count ; index++) {
+        if (data_point_list[index] == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         result = decode_numerical_data_point(cmt, map, data_point_list[index]);
     }
 
@@ -808,6 +902,10 @@ static int decode_summary_data_point(struct cmt *cmt,
 
     summary = (struct cmt_summary *) map->parent;
 
+    if (data_point->n_quantile_values > 0 && data_point->quantile_values == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     if (summary->quantiles == NULL) {
         summary->quantiles = calloc(data_point->n_quantile_values,
                                     sizeof(double));
@@ -821,16 +919,38 @@ static int decode_summary_data_point(struct cmt *cmt,
         for (index = 0 ;
              index < data_point->n_quantile_values ;
              index++) {
+            if (data_point->quantile_values[index] == NULL) {
+                return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            }
+
             summary->quantiles[index] = data_point->quantile_values[index]->quantile;
+        }
+    }
+    else {
+        /* the quantile layout is defined by the first data point and every
+         * sample is sized and read using it
+         */
+        if (data_point->n_quantile_values != summary->quantiles_count) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
+        for (index = 0 ;
+             index < data_point->n_quantile_values ;
+             index++) {
+            if (data_point->quantile_values[index] == NULL ||
+                data_point->quantile_values[index]->quantile !=
+                summary->quantiles[index]) {
+                return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            }
         }
     }
 
     static_metric_detected = CMT_FALSE;
 
     if (data_point->n_attributes == 0) {
-        if (map->metric_static_set == CMT_FALSE) {
-            static_metric_detected = CMT_TRUE;
-        }
+        /* Label-less points always target the static sample, the last
+         * one wins, as released versions behave. */
+        static_metric_detected = CMT_TRUE;
     }
 
     if (static_metric_detected == CMT_FALSE) {
@@ -861,7 +981,9 @@ static int decode_summary_data_point(struct cmt *cmt,
     }
     else {
         sample = &map->metric;
-
+        if (map->metric_static_set) {
+            reset_static_data_point(map);
+        }
         map->metric_static_set = CMT_TRUE;
     }
 
@@ -869,7 +991,7 @@ static int decode_summary_data_point(struct cmt *cmt,
         struct cfl_kvlist *point_metadata;
 
         if (cmt_atomic_load(&sample->sum_quantiles_set) == CMT_FALSE) {
-            sample->sum_quantiles = calloc(data_point->n_quantile_values,
+            sample->sum_quantiles = calloc(summary->quantiles_count,
                                            sizeof(uint64_t));
 
             if (sample->sum_quantiles == NULL) {
@@ -877,7 +999,7 @@ static int decode_summary_data_point(struct cmt *cmt,
             }
 
             cmt_atomic_store(&sample->sum_quantiles_set, CMT_TRUE);
-            sample->sum_quantiles_count = data_point->n_quantile_values;
+            sample->sum_quantiles_count = summary->quantiles_count;
         }
 
         for (index = 0 ;
@@ -892,6 +1014,10 @@ static int decode_summary_data_point(struct cmt *cmt,
                               data_point->count);
 
         point_metadata = get_or_create_data_point_metadata_context(cmt, map, sample, data_point->time_unix_nano);
+        if (point_metadata == NULL || clone_point_attributes(point_metadata, data_point->attributes,
+                                                            data_point->n_attributes) != 0) {
+            return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        }
         if (point_metadata != NULL) {
             cfl_kvlist_insert_uint64(point_metadata, "start_time_unix_nano", data_point->start_time_unix_nano);
             cfl_kvlist_insert_uint64(point_metadata, "flags", data_point->flags);
@@ -918,9 +1044,17 @@ static int decode_summary_data_point_list(struct cmt *cmt,
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (data_point_count > 0 && data_point_list == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     for (index = 0 ;
          result == CMT_DECODE_OPENTELEMETRY_SUCCESS &&
          index < data_point_count ; index++) {
+        if (data_point_list[index] == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         result = decode_summary_data_point(cmt, map, data_point_list[index]);
     }
 
@@ -933,6 +1067,7 @@ static int decode_histogram_data_point(struct cmt *cmt,
 {
     int                   static_metric_detected;
     struct cmt_histogram *histogram;
+    uint64_t cumulative = 0;
     struct cmt_metric    *sample;
     int                   result;
     size_t                index;
@@ -941,8 +1076,24 @@ static int decode_histogram_data_point(struct cmt *cmt,
 
     histogram = (struct cmt_histogram *) map->parent;
 
-    if (data_point->n_bucket_counts > data_point->n_explicit_bounds + 1) {
-        return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+    if (data_point->n_explicit_bounds > 0 && data_point->explicit_bounds == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (data_point->n_bucket_counts > 0 && data_point->bucket_counts == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (data_point->n_bucket_counts > INT_MAX) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    /* bucket_counts carries one entry per bound plus the +Inf bucket, it can
+     * only be empty when explicit_bounds is empty too
+     */
+    if ((data_point->n_bucket_counts > 0 || data_point->n_explicit_bounds > 0) &&
+        data_point->n_bucket_counts != data_point->n_explicit_bounds + 1) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
     }
 
     if (histogram->buckets == NULL) {
@@ -953,13 +1104,30 @@ static int decode_histogram_data_point(struct cmt *cmt,
             return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
         }
     }
+    else {
+        /* the bucket layout is defined by the first data point and every
+         * sample is sized and read using it
+         */
+        if (data_point->n_explicit_bounds != histogram->buckets->count) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
+        for (index = 0 ;
+             index < data_point->n_explicit_bounds ;
+             index++) {
+            if (data_point->explicit_bounds[index] !=
+                histogram->buckets->upper_bounds[index]) {
+                return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            }
+        }
+    }
 
     static_metric_detected = CMT_FALSE;
 
     if (data_point->n_attributes == 0) {
-        if (map->metric_static_set == CMT_FALSE) {
-            static_metric_detected = CMT_TRUE;
-        }
+        /* Label-less points always target the static sample, the last
+         * one wins, as released versions behave. */
+        static_metric_detected = CMT_TRUE;
     }
 
     if (static_metric_detected == CMT_FALSE) {
@@ -990,7 +1158,9 @@ static int decode_histogram_data_point(struct cmt *cmt,
     }
     else {
         sample = &map->metric;
-
+        if (map->metric_static_set) {
+            reset_static_data_point(map);
+        }
         map->metric_static_set = CMT_TRUE;
     }
 
@@ -998,7 +1168,11 @@ static int decode_histogram_data_point(struct cmt *cmt,
         struct cfl_kvlist *point_metadata;
 
         if (sample->hist_buckets == NULL) {
-            sample->hist_buckets = calloc(data_point->n_bucket_counts + 1,
+            /* size the storage from the metric layout, the encoders read
+             * buckets->count + 1 entries even when the data point carries
+             * fewer bucket counts
+             */
+            sample->hist_buckets = calloc(histogram->buckets->count + 1,
                                           sizeof(uint64_t));
 
             if (sample->hist_buckets == NULL) {
@@ -1009,8 +1183,11 @@ static int decode_histogram_data_point(struct cmt *cmt,
         for (index = 0 ;
              index < data_point->n_bucket_counts;
              index++) {
-            cmt_metric_hist_set(sample, data_point->time_unix_nano,
-                                index, data_point->bucket_counts[index]);
+            if (UINT64_MAX - cumulative < data_point->bucket_counts[index]) {
+                return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+            }
+            cumulative += data_point->bucket_counts[index];
+            cmt_metric_hist_set(sample, data_point->time_unix_nano, index, cumulative);
         }
 
         cmt_metric_hist_sum_set(sample, data_point->time_unix_nano,
@@ -1019,6 +1196,10 @@ static int decode_histogram_data_point(struct cmt *cmt,
                                   data_point->count);
 
         point_metadata = get_or_create_data_point_metadata_context(cmt, map, sample, data_point->time_unix_nano);
+        if (point_metadata == NULL || clone_point_attributes(point_metadata, data_point->attributes,
+                                                            data_point->n_attributes) != 0) {
+            return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        }
         if (point_metadata != NULL) {
             cfl_kvlist_insert_uint64(point_metadata, "start_time_unix_nano", data_point->start_time_unix_nano);
             cfl_kvlist_insert_uint64(point_metadata, "flags", data_point->flags);
@@ -1055,9 +1236,17 @@ static int decode_histogram_data_point_list(struct cmt *cmt,
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (data_point_count > 0 && data_point_list == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     for (index = 0 ;
          result == 0 &&
          index < data_point_count ; index++) {
+        if (data_point_list[index] == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         result = decode_histogram_data_point(cmt, map, data_point_list[index]);
     }
 
@@ -1196,12 +1385,24 @@ static int decode_exponential_histogram_data_point(struct cmt *cmt,
     new_positive_buckets = NULL;
     new_negative_buckets = NULL;
 
+    if (positive != NULL &&
+        positive->n_bucket_counts > 0 &&
+        positive->bucket_counts == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (negative != NULL &&
+        negative->n_bucket_counts > 0 &&
+        negative->bucket_counts == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     static_metric_detected = CMT_FALSE;
 
     if (data_point->n_attributes == 0) {
-        if (map->metric_static_set == CMT_FALSE) {
-            static_metric_detected = CMT_TRUE;
-        }
+        /* Label-less points always target the static sample, the last
+         * one wins, as released versions behave. */
+        static_metric_detected = CMT_TRUE;
     }
 
     if (static_metric_detected == CMT_FALSE) {
@@ -1230,6 +1431,9 @@ static int decode_exponential_histogram_data_point(struct cmt *cmt,
     }
     else {
         sample = &map->metric;
+        if (map->metric_static_set) {
+            reset_static_data_point(map);
+        }
         map->metric_static_set = CMT_TRUE;
     }
 
@@ -1292,6 +1496,10 @@ static int decode_exponential_histogram_data_point(struct cmt *cmt,
         struct cfl_kvlist *point_metadata;
 
         point_metadata = get_or_create_data_point_metadata_context(cmt, map, sample, data_point->time_unix_nano);
+        if (point_metadata == NULL || clone_point_attributes(point_metadata, data_point->attributes,
+                                                            data_point->n_attributes) != 0) {
+            return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+        }
         if (point_metadata != NULL) {
             cfl_kvlist_insert_uint64(point_metadata, "start_time_unix_nano", data_point->start_time_unix_nano);
             cfl_kvlist_insert_uint64(point_metadata, "flags", data_point->flags);
@@ -1329,10 +1537,18 @@ static int decode_exponential_histogram_data_point_list(
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (data_point_count > 0 && data_point_list == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     for (index = 0 ;
          result == CMT_DECODE_OPENTELEMETRY_SUCCESS &&
          index < data_point_count ;
          index++) {
+        if (data_point_list[index] == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         result = decode_exponential_histogram_data_point(cmt, map, data_point_list[index]);
     }
 
@@ -1384,6 +1600,10 @@ static int decode_metrics_entry(struct cmt *cmt,
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (metric == NULL || metric->name == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     metric_name = metric->name;
     metric_unit = metric->unit;
     metric_namespace = "";
@@ -1398,6 +1618,10 @@ static int decode_metrics_entry(struct cmt *cmt,
     }
 
     if (metric->data_case == OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUM) {
+        if (metric->sum == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         instance = cmt_counter_create(cmt,
                                       metric_namespace,
                                       metric_subsystem,
@@ -1438,6 +1662,10 @@ static int decode_metrics_entry(struct cmt *cmt,
         }
     }
     else if (metric->data_case == OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_GAUGE) {
+        if (metric->gauge == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         instance = cmt_gauge_create(cmt,
                                     metric_namespace,
                                     metric_subsystem,
@@ -1478,6 +1706,10 @@ static int decode_metrics_entry(struct cmt *cmt,
         }
     }
     else if (metric->data_case == OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUMMARY) {
+        if (metric->summary == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         instance = cmt_summary_create(cmt,
                                       metric_namespace,
                                       metric_subsystem,
@@ -1523,6 +1755,10 @@ static int decode_metrics_entry(struct cmt *cmt,
         }
     }
     else if (metric->data_case == OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_HISTOGRAM) {
+        if (metric->histogram == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         instance = cmt_histogram_create(cmt,
                                         metric_namespace,
                                         metric_subsystem,
@@ -1564,6 +1800,10 @@ static int decode_metrics_entry(struct cmt *cmt,
         }
     }
     else if (metric->data_case == OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_EXPONENTIAL_HISTOGRAM) {
+        if (metric->exponential_histogram == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         instance = cmt_exp_histogram_create(cmt,
                                             metric_namespace,
                                             metric_subsystem,
@@ -1604,6 +1844,9 @@ static int decode_metrics_entry(struct cmt *cmt,
                 }
             }
         }
+    }
+    else {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
     }
 
     return result;
@@ -1718,6 +1961,10 @@ static int decode_scope_metrics_entry(struct cfl_list *context_list,
     int         result;
     size_t      index;
 
+    if (metrics == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     context = cmt_create();
 
     if (context == NULL) {
@@ -1754,6 +2001,10 @@ static int decode_scope_metrics_entry(struct cfl_list *context_list,
 
     if (result != CMT_DECODE_OPENTELEMETRY_SUCCESS) {
         return result;
+    }
+
+    if (metrics->n_metrics > 0 && metrics->metrics == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
     }
 
     for (index = 0 ;
@@ -1864,6 +2115,15 @@ static int decode_resource_metrics_entry(
 
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
+    if (resource_metrics == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (resource_metrics->n_scope_metrics > 0 &&
+        resource_metrics->scope_metrics == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     for (index = 0 ;
          result == CMT_DECODE_OPENTELEMETRY_SUCCESS &&
          index < resource_metrics->n_scope_metrics ;
@@ -1923,6 +2183,10 @@ static int decode_service_request(struct cfl_list *context_list,
     result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
 
     if (service_request->n_resource_metrics > 0) {
+        if (service_request->resource_metrics == NULL) {
+            return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+        }
+
         for (index = 0 ;
              result == CMT_DECODE_OPENTELEMETRY_SUCCESS &&
              index < service_request->n_resource_metrics ;
@@ -1945,7 +2209,21 @@ int cmt_decode_opentelemetry_create(struct cfl_list *result_context_list,
 
     result = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
 
+    if (result_context_list == NULL) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
     cfl_list_init(result_context_list);
+
+    if (in_buf == NULL || offset == NULL || *offset > in_size) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (cmt_protobuf_validate(
+            &opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__descriptor,
+            &in_buf[*offset], in_size - *offset) != 0) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
 
     service_request = opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__unpack(NULL, in_size - *offset,
                                                                                                            (unsigned char *) &in_buf[*offset]);

@@ -21,7 +21,13 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef FLB_SYSTEM_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_mem.h>
@@ -85,6 +91,87 @@ static inline size_t http2_lower_value(size_t left_value, size_t right_value)
     return right_value;
 }
 
+static int http2_is_ipv6_literal(const char *host,
+                                 char *address_buffer,
+                                 size_t address_buffer_size,
+                                 const char **host_for_authority)
+{
+    struct in6_addr address;
+    const char     *zone_id;
+    size_t          host_length;
+
+    *host_for_authority = host;
+
+    if (host == NULL || host[0] == '[') {
+        return FLB_FALSE;
+    }
+
+    zone_id = strchr(host, '%');
+
+    if (zone_id != NULL) {
+        host_length = zone_id - host;
+
+        if (host_length == 0 || host_length >= address_buffer_size) {
+            return FLB_FALSE;
+        }
+
+        memcpy(address_buffer, host, host_length);
+        address_buffer[host_length] = '\0';
+
+        if (inet_pton(AF_INET6, address_buffer, &address) == 1) {
+            return FLB_TRUE;
+        }
+
+        return FLB_FALSE;
+    }
+
+    if (inet_pton(AF_INET6, host, &address) == 1) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+static int http2_request_set_authority(struct flb_http_request *request)
+{
+    cfl_sds_t  sds_result;
+    const char *host_for_authority;
+    char        address_buffer[INET6_ADDRSTRLEN];
+    int         is_ipv6;
+
+    request->authority = cfl_sds_create_size(strlen(request->host) + 32);
+
+    if (request->authority == NULL) {
+        return -1;
+    }
+
+    is_ipv6 = http2_is_ipv6_literal(request->host,
+                                    address_buffer,
+                                    sizeof(address_buffer),
+                                    &host_for_authority);
+
+    if (is_ipv6) {
+        sds_result = cfl_sds_printf(&request->authority,
+                                    "[%s]:%u",
+                                    host_for_authority,
+                                    request->port);
+    }
+    else {
+        sds_result = cfl_sds_printf(&request->authority,
+                                    "%s:%u",
+                                    request->host,
+                                    request->port);
+    }
+
+    if (sds_result == NULL) {
+        return -1;
+    }
+
+    request->authority = sds_result;
+
+    return 0;
+}
+
 /* PRIVATE */
 
 static ssize_t http2_send_callback(nghttp2_session *inner_session,
@@ -122,6 +209,7 @@ static int http2_header_callback(nghttp2_session *inner_session,
 {
     char                     temporary_buffer[16];
     struct flb_http_stream  *stream;
+    struct flb_http_client_ng *client;
     int                      result;
 
     stream = nghttp2_session_get_stream_user_data(inner_session,
@@ -130,6 +218,21 @@ static int http2_header_callback(nghttp2_session *inner_session,
     if (stream == NULL) {
         return 0;
     }
+
+    client = ((struct flb_http_client_session *) stream->parent)->parent;
+
+    if (stream->incoming_header_count >= client->max_header_count ||
+        name_length > client->max_header_size - 32 ||
+        value_length > client->max_header_size - 32 - name_length ||
+        stream->incoming_header_size >
+            client->max_header_size - 32 - name_length - value_length) {
+        ((struct flb_http_client_session *) stream->parent)->response_limit_exceeded = FLB_TRUE;
+        stream->status = HTTP_STREAM_STATUS_ERROR;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+
+    stream->incoming_header_count++;
+    stream->incoming_header_size += name_length + value_length + 32;
 
     if (flb_http_server_strncasecmp(
                 name, name_length, ":status", 0) == 0) {
@@ -277,6 +380,16 @@ static int http2_data_chunk_recv_callback(nghttp2_session *inner_session,
         return -1;
     }
 
+    parent_session = (struct flb_http_client_session *) stream->parent;
+    if (len > parent_session->parent->max_response_size ||
+        (stream->response.body != NULL &&
+         cfl_sds_len(stream->response.body) >
+         parent_session->parent->max_response_size - len)) {
+        parent_session->response_limit_exceeded = FLB_TRUE;
+        stream->status = HTTP_STREAM_STATUS_ERROR;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+
     if (stream->response.body == NULL) {
         stream->response.body = cfl_sds_create_size(len);
 
@@ -386,7 +499,7 @@ static ssize_t http2_data_source_read_callback(nghttp2_session *session,
 
 int flb_http2_client_session_init(struct flb_http2_client_session *session)
 {
-    nghttp2_settings_entry     session_settings[3];
+    nghttp2_settings_entry     session_settings[4];
     nghttp2_session_callbacks *callbacks;
     int                        result;
 
@@ -427,11 +540,14 @@ int flb_http2_client_session_init(struct flb_http2_client_session *session)
     session_settings[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
     session_settings[2].value = 0;
 
+    session_settings[3].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE;
+    session_settings[3].value = session->parent->parent->max_header_size;
+
 
     result = nghttp2_submit_settings(session->inner_session,
                                      NGHTTP2_FLAG_NONE,
                                      session_settings,
-                                     3);
+                                     4);
 
     if (result != 0) {
         return -3;
@@ -486,7 +602,6 @@ int flb_http2_request_begin(struct flb_http_request *request)
 int flb_http2_request_commit(struct flb_http_request *request)
 {
     struct flb_http_client_session  *parent_session;
-    cfl_sds_t                        sds_result;
     struct flb_http2_client_session *session;
     struct flb_http_stream          *stream;
     int                              result;
@@ -562,17 +677,8 @@ int flb_http2_request_commit(struct flb_http_request *request)
     }
 
     if (request->authority == NULL) {
-        request->authority = cfl_sds_create(request->host);
-
-        if (request->authority == NULL) {
-            return -1;
-        }
-
-        sds_result = cfl_sds_printf(&request->authority,
-                                    ":%u",
-                                    request->port);
-
-        if (sds_result == NULL) {
+        result = http2_request_set_authority(request);
+        if (result != 0) {
             return -1;
         }
     }

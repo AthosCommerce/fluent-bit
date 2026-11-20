@@ -129,7 +129,7 @@ static int str_to_regex(const char *pattern, OnigRegex *reg)
 
     option = check_option(start, end, &new_end);
 
-    if (pattern[0] == '/' && pattern[len - 1] == '/') {
+    if (len > 1 && pattern[0] == '/' && pattern[len - 1] == '/') {
         start++;
         end--;
     }
@@ -214,7 +214,8 @@ ssize_t flb_regex_do(struct flb_regex *r, const char *str, size_t slen,
     else if (ret < 0) {
         result->region = NULL;
         onig_region_free(region, 1);
-        return -1;
+        flb_error("[regex] search failed: %d", ret);
+        return ret;
     }
 
     result->region   = region;
@@ -285,6 +286,7 @@ int flb_regex_match(struct flb_regex *r, unsigned char *str, size_t slen)
         return 0;
     }
     else if (ret < 0) {
+        flb_error("[regex] search failed: %d", ret);
         return ret;
     }
     return 1;

@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include "flb_tests_runtime.h"
 
+#define DPATH            FLB_TESTS_DATA_PATH "/data/common"
 #define DEFAULT_IO_TIMEOUT 10
 #define DEFAULT_HOST       "127.0.0.1"
 #define DEFAULT_PORT       5170
@@ -35,6 +36,13 @@
 #define TLS_CERTIFICATE_HOSTNAME "leo.vcap.me"
 #define TLS_CERTIFICATE_FILENAME FLB_TESTS_DATA_PATH "/data/tls/certificate.pem"
 #define TLS_PRIVATE_KEY_FILENAME FLB_TESTS_DATA_PATH "/data/tls/private_key.pem"
+
+#define TLS_CA_FILE                  FLB_TESTS_DATA_PATH "/data/tls/ca_certificate.pem"
+#define TLS_CLIENT_CERT_FILE         FLB_TESTS_DATA_PATH "/data/tls/client_certificate.pem"
+#define TLS_CLIENT_KEY_FILE          FLB_TESTS_DATA_PATH "/data/tls/client_private_key.pem"
+#define TLS_CLIENT_CERT_REVOKED_FILE FLB_TESTS_DATA_PATH "/data/tls/client_certificate_revoked.pem"
+#define TLS_CLIENT_KEY_REVOKED_FILE  FLB_TESTS_DATA_PATH "/data/tls/client_private_key_revoked.pem"
+#define TLS_CRL_FILE                 FLB_TESTS_DATA_PATH "/data/tls/crl.pem"
 
 struct test_ctx {
     flb_ctx_t *flb;    /* Fluent Bit library context */
@@ -263,6 +271,7 @@ static struct test_ctx *test_ctx_create(struct flb_lib_out_cb *data)
                     "Flush", "0.200000000",
                     "Grace", "1",
                     "Log_Level", "error",
+                    "Parsers_File", DPATH "/parsers.conf",
                     NULL);
 
     /* Input */
@@ -545,6 +554,142 @@ void flb_test_tcp_with_tls()
     flb_free(ctx);
 }
 
+/*
+ * The tcp input acts as a TLS server that verifies the client certificate
+ * against a CRL (tls.crl_file). A valid client must be accepted (records
+ * ingested); a revoked client must be rejected (no records).
+ */
+static void run_tls_crl_client(const char *client_cert, const char *client_key,
+                               int expect_output)
+{
+    struct flb_connection *client_connection;
+    struct flb_upstream   *upstream;
+    struct flb_lib_out_cb  cb_data;
+    size_t                 sent;
+    struct test_ctx       *ctx;
+    int                    ret;
+    int                    num;
+    struct flb_tls        *tls;
+
+    char *buf = "{\"test\":\"msg\"}";
+    size_t size = strlen(buf);
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "tls",          "on",
+                        "tls.verify",   "on",
+                        "tls.vhost",    TLS_CERTIFICATE_HOSTNAME,
+                        "tls.crt_file", TLS_CERTIFICATE_FILENAME,
+                        "tls.key_file", TLS_PRIVATE_KEY_FILENAME,
+                        "tls.ca_file",  TLS_CA_FILE,
+                        "tls.crl_file", TLS_CRL_FILE,
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_tls_init();
+    TEST_CHECK(ret == 0);
+
+    /* Client presents the certificate under test */
+    tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                         FLB_FALSE,
+                         FLB_TRUE,
+                         TLS_CERTIFICATE_HOSTNAME,
+                         NULL,
+                         TLS_CA_FILE,
+                         client_cert,
+                         client_key,
+                         NULL);
+
+    TEST_CHECK(tls != NULL);
+
+    /*
+     * Force TLS 1.2 so the client certificate is verified during the
+     * handshake. Under TLS 1.3 the client is authenticated after the
+     * handshake completes (post-handshake auth).
+     */
+    ret = flb_tls_set_minmax_proto(tls, "TLSv1.2", "TLSv1.2");
+    TEST_CHECK(ret == 0);
+
+    upstream = flb_upstream_create(ctx->flb->config,
+                                   DEFAULT_HOST,
+                                   DEFAULT_PORT,
+                                   FLB_IO_TCP | FLB_IO_TLS,
+                                   tls);
+
+    TEST_CHECK(upstream != NULL);
+
+    flb_stream_disable_async_mode(&upstream->base);
+
+    upstream->base.net.io_timeout = DEFAULT_IO_TIMEOUT;
+
+    /* Connecting performs the TLS handshake (and client-cert verification) */
+    client_connection = flb_upstream_conn_get(upstream);
+
+    if (client_connection != NULL) {
+        ret = flb_io_net_write(client_connection,
+                               (void *) buf,
+                                size,
+                                &sent);
+        (void) ret;
+
+        /* waiting to flush */
+        flb_time_msleep(1500);
+    }
+
+    num = get_output_num();
+
+    if (expect_output) {
+        if (!TEST_CHECK(num > 0)) {
+            TEST_MSG("valid client: expected ingested records, got %d", num);
+        }
+    }
+    else {
+        if (!TEST_CHECK(num == 0)) {
+            TEST_MSG("revoked client: expected rejection, but %d records ingested",
+                     num);
+        }
+    }
+
+    sleep(1);
+
+    flb_stop(ctx->flb);
+    flb_upstream_destroy(upstream);
+    flb_tls_destroy(tls);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+}
+
+void flb_test_tcp_tls_crl_valid_client()
+{
+    run_tls_crl_client(TLS_CLIENT_CERT_FILE, TLS_CLIENT_KEY_FILE, FLB_TRUE);
+}
+
+void flb_test_tcp_tls_crl_revoked_client()
+{
+    run_tls_crl_client(TLS_CLIENT_CERT_REVOKED_FILE, TLS_CLIENT_KEY_REVOKED_FILE,
+                       FLB_FALSE);
+}
+
 void flb_test_format_none()
 {
     struct flb_lib_out_cb cb_data;
@@ -671,6 +816,107 @@ void flb_test_format_none_separator()
     flb_socket_close(fd);
     test_ctx_destroy(ctx);
 }
+
+#ifdef FLB_HAVE_PARSER
+void flb_test_format_none_with_parser()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    flb_sockfd_t fd;
+    int ret;
+    int num;
+    ssize_t w_size;
+    char *buf = "{\"test\":\"msg\"}\n";
+    size_t size = strlen(buf);
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "format", "none",
+                        "parser", "json",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    fd = connect_tcp(NULL, -1);
+    if (!TEST_CHECK(fd >= 0)) {
+        exit(EXIT_FAILURE);
+    }
+
+    w_size = send(fd, buf, size, 0);
+    if (!TEST_CHECK(w_size == size)) {
+        TEST_MSG("failed to send, errno=%d", errno);
+        flb_socket_close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    flb_time_msleep(1500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0)) {
+        TEST_MSG("no outputs");
+    }
+
+    flb_socket_close(fd);
+    test_ctx_destroy(ctx);
+}
+
+void flb_test_format_none_with_unknown_parser()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    int ret;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "format", "none",
+                        "parser", "nonexistent_parser",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    if (!TEST_CHECK(ret != 0)) {
+        TEST_MSG("flb_start unexpectedly succeeded with unknown parser");
+    }
+
+    /* flb_start failed, so there is no running engine to stop. */
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+}
+#endif
 
 /*
  * Ingest 64k records.
@@ -839,10 +1085,15 @@ TEST_LIST = {
     {"tcp", flb_test_tcp},
     {"tcp_with_source_address", flb_test_tcp_with_source_address},
     {"tcp_with_tls", flb_test_tcp_with_tls},
+    {"tcp_with_tls_crl_valid_client", flb_test_tcp_tls_crl_valid_client},
+    {"tcp_with_tls_crl_revoked_client", flb_test_tcp_tls_crl_revoked_client},
     {"format_none", flb_test_format_none},
     {"format_none_separator", flb_test_format_none_separator},
+#ifdef FLB_HAVE_PARSER
+    {"format_none_with_parser", flb_test_format_none_with_parser},
+    {"format_none_with_unknown_parser", flb_test_format_none_with_unknown_parser},
+#endif
     {"format_none_large_record", flb_test_format_none_large_record},
     {"65535_records_issue_5336", flb_test_issue_5336},
     {NULL, NULL}
 };
-

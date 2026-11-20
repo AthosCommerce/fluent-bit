@@ -23,7 +23,9 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_aws_credentials.h>
+#include <fluent-bit/flb_slist.h>
 
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -38,6 +40,130 @@ static inline int key_cmp(char *str, int len, char *cmp) {
     }
 
     return strncasecmp(str, cmp, len);
+}
+
+static void chronicle_labels_destroy(struct flb_chronicle *ctx)
+{
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct flb_chronicle_label *label;
+
+    mk_list_foreach_safe(head, tmp, &ctx->labels) {
+        label = mk_list_entry(head, struct flb_chronicle_label, _head);
+        mk_list_del(&label->_head);
+
+        flb_sds_destroy(label->key);
+        flb_sds_destroy(label->value);
+
+        if (label->ra) {
+            flb_ra_destroy(label->ra);
+        }
+
+        flb_free(label);
+    }
+}
+
+static int chronicle_label_add(struct flb_chronicle *ctx,
+                               char *key, size_t key_len,
+                               char *value, size_t value_len)
+{
+    struct flb_chronicle_label *label;
+
+    if (key == NULL || key_len == 0 || value == NULL) {
+        flb_plg_error(ctx->ins, "label requires a non-empty key and value");
+        return -1;
+    }
+
+    label = flb_calloc(1, sizeof(struct flb_chronicle_label));
+    if (!label) {
+        flb_errno();
+        return -1;
+    }
+
+    label->key = flb_sds_create_len(key, key_len);
+    if (!label->key) {
+        flb_free(label);
+        return -1;
+    }
+
+    label->value = flb_sds_create_len(value, value_len);
+    if (!label->value) {
+        flb_sds_destroy(label->key);
+        flb_free(label);
+        return -1;
+    }
+
+    if (memchr(value, '$', value_len) != NULL) {
+        label->ra = flb_ra_create(label->value, FLB_FALSE);
+        if (!label->ra) {
+            flb_plg_error(ctx->ins, "invalid label record accessor '%s'",
+                          label->value);
+            flb_sds_destroy(label->key);
+            flb_sds_destroy(label->value);
+            flb_free(label);
+            return -1;
+        }
+    }
+
+    mk_list_add(&label->_head, &ctx->labels);
+    return 0;
+}
+
+static int chronicle_label_exists(struct flb_chronicle *ctx, flb_sds_t key)
+{
+    struct mk_list *head;
+    struct flb_chronicle_label *label;
+
+    mk_list_foreach(head, &ctx->labels) {
+        label = mk_list_entry(head, struct flb_chronicle_label, _head);
+
+        if (flb_sds_len(label->key) == flb_sds_len(key) &&
+            strncmp(label->key, key, flb_sds_len(key)) == 0) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
+}
+
+static int chronicle_configure_labels(struct flb_chronicle *ctx)
+{
+    int ret;
+    struct mk_list *head;
+    struct flb_config_map_val *mv;
+    struct flb_slist_entry *key;
+    struct flb_slist_entry *val;
+
+    if (ctx->label_properties) {
+        flb_config_map_foreach(head, mv, ctx->label_properties) {
+            if (mk_list_size(mv->val.list) != 2) {
+                flb_plg_error(ctx->ins, "'label' expects a key and a value");
+                return -1;
+            }
+
+            key = mk_list_entry_first(mv->val.list,
+                                      struct flb_slist_entry, _head);
+            val = mk_list_entry_last(mv->val.list,
+                                     struct flb_slist_entry, _head);
+
+            /* The Chronicle API sends labels as a map keyed by label name */
+            if (ctx->api == FLB_CHRONICLE_API_CHRONICLE &&
+                chronicle_label_exists(ctx, key->str) == FLB_TRUE) {
+                flb_plg_error(ctx->ins, "duplicate label '%s' is not supported "
+                              "by the Chronicle API", key->str);
+                return -1;
+            }
+
+            ret = chronicle_label_add(ctx,
+                                      key->str, flb_sds_len(key->str),
+                                      val->str, flb_sds_len(val->str));
+            if (ret != 0) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 static int flb_chronicle_read_credentials_file(struct flb_chronicle *ctx,
@@ -170,6 +296,100 @@ static int flb_chronicle_read_credentials_file(struct flb_chronicle *ctx,
     return 0;
 }
 
+/* Check that a value can be used as-is as a segment of the request path */
+static int chronicle_api_check_path_segment(struct flb_chronicle *ctx,
+                                            const char *name, flb_sds_t value)
+{
+    size_t i;
+    char c;
+
+    if (flb_sds_len(value) == 0) {
+        flb_plg_error(ctx->ins, "property '%s' cannot be empty", name);
+        return -1;
+    }
+
+    for (i = 0; i < flb_sds_len(value); i++) {
+        c = value[i];
+        if (!isalnum((unsigned char) c) &&
+            c != '-' && c != '.' && c != '_' && c != '~' && c != ':') {
+            flb_plg_error(ctx->ins, "property '%s' has an invalid character: '%s'",
+                          name, value);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Compose the base URI and the logs:import endpoint for the Chronicle API */
+static int chronicle_api_configure(struct flb_chronicle *ctx)
+{
+    size_t i;
+    char c;
+    flb_sds_t tmp;
+
+    /* The region is the location of the Google SecOps instance, e.g: 'us' */
+    if (ctx->region == NULL) {
+        ctx->location = flb_sds_create(FLB_CHRONICLE_API_DEFAULT_LOCATION);
+    }
+    else {
+        ctx->location = flb_sds_create(ctx->region);
+    }
+    if (!ctx->location) {
+        flb_errno();
+        return -1;
+    }
+
+    /* The location is also part of the hostname */
+    if (flb_sds_len(ctx->location) == 0) {
+        flb_plg_error(ctx->ins, "property 'region' cannot be empty");
+        return -1;
+    }
+
+    for (i = 0; i < flb_sds_len(ctx->location); i++) {
+        c = tolower((unsigned char) ctx->location[i]);
+        if (!isalnum((unsigned char) c) && c != '-') {
+            flb_plg_error(ctx->ins, "invalid region '%s' for the Chronicle API",
+                          ctx->region);
+            return -1;
+        }
+        ctx->location[i] = c;
+    }
+
+    if (chronicle_api_check_path_segment(ctx, "project_id", ctx->project_id) != 0 ||
+        chronicle_api_check_path_segment(ctx, "customer_id", ctx->customer_id) != 0 ||
+        chronicle_api_check_path_segment(ctx, "log_type", ctx->log_type) != 0) {
+        return -1;
+    }
+
+    ctx->uri = flb_sds_create_size(64);
+    if (!ctx->uri) {
+        flb_errno();
+        return -1;
+    }
+
+    tmp = flb_sds_printf(&ctx->uri, FLB_CHRONICLE_API_URL_BASE, ctx->location);
+    if (!tmp) {
+        return -1;
+    }
+
+    ctx->endpoint = flb_sds_create_size(256);
+    if (!ctx->endpoint) {
+        flb_errno();
+        return -1;
+    }
+
+    tmp = flb_sds_printf(&ctx->endpoint, FLB_CHRONICLE_API_IMPORT_ENDPOINT,
+                         ctx->project_id, ctx->location,
+                         ctx->customer_id, ctx->log_type);
+    if (!tmp) {
+        return -1;
+    }
+
+    ctx->max_payload_size = FLB_CHRONICLE_API_MAX_PAYLOAD_SIZE;
+
+    return 0;
+}
 
 struct flb_chronicle *flb_chronicle_conf_create(struct flb_output_instance *ins,
                                               struct flb_config *config)
@@ -187,12 +407,41 @@ struct flb_chronicle *flb_chronicle_conf_create(struct flb_output_instance *ins,
     }
     ctx->ins = ins;
     ctx->config = config;
+    mk_list_init(&ctx->labels);
 
     ret = flb_output_config_map_set(ins, (void *)ctx);
     if (ret == -1) {
         flb_plg_error(ins, "unable to load configuration");
         flb_free(ctx);
         return NULL;
+    }
+
+    /* config: 'api' */
+    if (strcasecmp(ctx->api_str, "legacy") == 0) {
+        ctx->api = FLB_CHRONICLE_API_LEGACY;
+    }
+    else if (strcasecmp(ctx->api_str, "chronicle") == 0) {
+        ctx->api = FLB_CHRONICLE_API_CHRONICLE;
+    }
+    else {
+        flb_plg_error(ins, "invalid api '%s', expected 'legacy' or 'chronicle'",
+                      ctx->api_str);
+        flb_free(ctx);
+        return NULL;
+    }
+
+    /* config: 'compress' */
+    ctx->compress_gzip = FLB_FALSE;
+    if (ctx->compress_str) {
+        if (strcasecmp(ctx->compress_str, "gzip") == 0) {
+            ctx->compress_gzip = FLB_TRUE;
+        }
+        else if (strcasecmp(ctx->compress_str, "none") != 0) {
+            flb_plg_error(ins, "invalid compress '%s', expected 'gzip' or 'none'",
+                          ctx->compress_str);
+            flb_free(ctx);
+            return NULL;
+        }
     }
 
     /* Lookup credentials file */
@@ -302,6 +551,28 @@ struct flb_chronicle *flb_chronicle_conf_create(struct flb_output_instance *ins,
         return NULL;
     }
 
+    if (ctx->namespace && flb_sds_len(ctx->namespace) == 0) {
+        flb_plg_error(ctx->ins, "property 'namespace' cannot be empty");
+        flb_chronicle_conf_destroy(ctx);
+        return NULL;
+    }
+
+    if (ctx->namespace_key) {
+        ctx->namespace_ra = flb_ra_create(ctx->namespace_key, FLB_FALSE);
+        if (!ctx->namespace_ra) {
+            flb_plg_error(ctx->ins, "invalid namespace_key record accessor '%s'",
+                          ctx->namespace_key);
+            flb_chronicle_conf_destroy(ctx);
+            return NULL;
+        }
+    }
+
+    ret = chronicle_configure_labels(ctx);
+    if (ret != 0) {
+        flb_chronicle_conf_destroy(ctx);
+        return NULL;
+    }
+
     /* Date key */
     ctx->date_key = ctx->json_date_key;
     tmp = flb_output_get_property("json_date_key", ins);
@@ -325,6 +596,22 @@ struct flb_chronicle *flb_chronicle_conf_create(struct flb_output_instance *ins,
             ctx->json_date_format = ret;
         }
     }
+
+    if (ctx->api == FLB_CHRONICLE_API_CHRONICLE) {
+        ret = chronicle_api_configure(ctx);
+        if (ret != 0) {
+            flb_chronicle_conf_destroy(ctx);
+            return NULL;
+        }
+
+        flb_plg_info(ctx->ins, "api='chronicle' project='%s' customer_id='%s' "
+                     "location='%s'",
+                     ctx->project_id, ctx->customer_id, ctx->location);
+
+        return ctx;
+    }
+
+    ctx->max_payload_size = FLB_CHRONICLE_MAX_PAYLOAD_SIZE;
 
     /* Create the target endpoint URI */
     ctx->endpoint = flb_sds_create_size(sizeof(FLB_CHRONICLE_UNSTRUCTURED_ENDPOINT));
@@ -413,10 +700,17 @@ int flb_chronicle_conf_destroy(struct flb_chronicle *ctx)
 
     flb_sds_destroy(ctx->endpoint);
     flb_sds_destroy(ctx->uri);
+    flb_sds_destroy(ctx->location);
 
     if (ctx->o) {
         flb_oauth2_destroy(ctx->o);
     }
+
+    if (ctx->namespace_ra) {
+        flb_ra_destroy(ctx->namespace_ra);
+    }
+
+    chronicle_labels_destroy(ctx);
 
     flb_free(ctx);
     return 0;

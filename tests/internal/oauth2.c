@@ -7,6 +7,7 @@
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_oauth2.h>
+#include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_upstream.h>
 #include <fluent-bit/flb_base64.h>
@@ -92,6 +93,8 @@ struct oauth2_mock_server {
     int expires_in;
     char latest_token[64];
     char latest_token_request[MOCK_BODY_SIZE];
+    int token_user_agent_seen;
+    char token_user_agent[256];
     pthread_t thread;
 #ifdef _WIN32
     int wsa_initialized;
@@ -152,9 +155,45 @@ static int request_content_length(const char *request)
     return len;
 }
 
+static int request_header_value(const char *request, const char *header_name,
+                                char *out, size_t out_size)
+{
+    int header_len;
+    const char *end;
+    const char *start;
+    size_t value_len;
+
+    start = strstr(request, header_name);
+    if (!start) {
+        return -1;
+    }
+
+    header_len = strlen(header_name);
+    start += header_len;
+    while (*start == ' ') {
+        start++;
+    }
+
+    end = strstr(start, "\r\n");
+    if (!end) {
+        return -1;
+    }
+
+    value_len = end - start;
+    if (value_len >= out_size) {
+        return -1;
+    }
+
+    memcpy(out, start, value_len);
+    out[value_len] = '\0';
+
+    return 0;
+}
+
 static void handle_token_request(struct oauth2_mock_server *server, flb_sockfd_t fd,
                                  const char *request)
 {
+    int ret;
     char payload[MOCK_BODY_SIZE];
     char *body;
     size_t body_len;
@@ -162,6 +201,16 @@ static void handle_token_request(struct oauth2_mock_server *server, flb_sockfd_t
     server->token_requests++;
     snprintf(server->latest_token, sizeof(server->latest_token),
              "mock-token-%d", server->token_requests);
+
+    server->token_user_agent_seen = FLB_FALSE;
+    server->token_user_agent[0] = '\0';
+    ret = request_header_value(request,
+                               "User-Agent:",
+                               server->token_user_agent,
+                               sizeof(server->token_user_agent));
+    if (ret == 0) {
+        server->token_user_agent_seen = FLB_TRUE;
+    }
 
     body = strstr(request, "\r\n\r\n");
     if (body) {
@@ -464,11 +513,16 @@ static void oauth2_mock_server_stop(struct oauth2_mock_server *server)
 #endif
 }
 
-static struct flb_oauth2 *create_oauth_ctx(struct flb_config *config,
-                                           struct oauth2_mock_server *server,
-                                           int refresh_skew)
+static struct flb_oauth2 *create_oauth_ctx_with_user_agent(struct flb_config *config,
+                                                           struct oauth2_mock_server *server,
+                                                           int refresh_skew,
+                                                           const char *user_agent)
 {
     struct flb_oauth2_config cfg;
+    struct flb_oauth2 *ctx;
+    struct flb_output_instance ins = {0};
+
+    ins.config = config;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.enabled = FLB_TRUE;
@@ -477,12 +531,96 @@ static struct flb_oauth2 *create_oauth_ctx(struct flb_config *config,
     cfg.refresh_skew = refresh_skew;
     cfg.client_id = flb_sds_create("id");
     cfg.client_secret = flb_sds_create("secret");
+    if (user_agent) {
+        cfg.user_agent = flb_sds_create(user_agent);
+    }
 
     flb_sds_printf(&cfg.token_url, "http://127.0.0.1:%d/token", server->port);
 
-    struct flb_oauth2 *ctx = flb_oauth2_create_from_config(config, &cfg);
+    ctx = flb_oauth2_create_from_config(&ins, &cfg);
 
     flb_oauth2_config_destroy(&cfg);
+
+    return ctx;
+}
+
+static struct flb_oauth2 *create_oauth_ctx(struct flb_config *config,
+                                           struct oauth2_mock_server *server,
+                                           int refresh_skew)
+{
+    return create_oauth_ctx_with_user_agent(config, server, refresh_skew, NULL);
+}
+
+void test_user_agent_header_optional(void)
+{
+    int ret;
+    flb_sds_t token = NULL;
+    struct flb_config *config;
+    struct flb_oauth2 *ctx;
+    struct oauth2_mock_server server;
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+
+    ret = oauth2_mock_server_start(&server, 3600, 0);
+    TEST_CHECK(ret == 0);
+
+    ctx = create_oauth_ctx(config, &server, 58);
+    TEST_CHECK(ctx != NULL);
+
+#ifdef FLB_SYSTEM_MACOS
+    ret = oauth2_mock_server_wait_ready(&server);
+    TEST_CHECK(ret == 0);
+#endif
+
+    ret = flb_oauth2_get_access_token(ctx, &token, FLB_FALSE);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(server.token_user_agent_seen == FLB_FALSE);
+
+    flb_oauth2_destroy(ctx);
+    oauth2_mock_server_stop(&server);
+
+    ret = oauth2_mock_server_start(&server, 3600, 0);
+    TEST_CHECK(ret == 0);
+
+    ctx = create_oauth_ctx_with_user_agent(config, &server, 58,
+                                           "oauth2-agent-test/1.0");
+    TEST_CHECK(ctx != NULL);
+
+#ifdef FLB_SYSTEM_MACOS
+    ret = oauth2_mock_server_wait_ready(&server);
+    TEST_CHECK(ret == 0);
+#endif
+
+    ret = flb_oauth2_get_access_token(ctx, &token, FLB_FALSE);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(server.token_user_agent_seen == FLB_TRUE);
+    TEST_CHECK(strcmp(server.token_user_agent, "oauth2-agent-test/1.0") == 0);
+
+    flb_oauth2_destroy(ctx);
+    oauth2_mock_server_stop(&server);
+    flb_config_exit(config);
+}
+
+static struct flb_oauth2 *create_legacy_oauth_ctx(struct flb_config *config,
+                                                  struct oauth2_mock_server *server)
+{
+    flb_sds_t token_url;
+    struct flb_oauth2 *ctx;
+    struct flb_output_instance ins = {0};
+
+    ins.config = config;
+
+    token_url = flb_sds_create_size(64);
+    TEST_CHECK(token_url != NULL);
+    if (!token_url) {
+        return NULL;
+    }
+
+    flb_sds_printf(&token_url, "http://127.0.0.1:%d/token", server->port);
+
+    ctx = flb_oauth2_create(&ins, token_url, 300);
+    flb_sds_destroy(token_url);
 
     return ctx;
 }
@@ -740,6 +878,9 @@ static struct flb_oauth2 *create_private_key_jwt_ctx(struct flb_config *config,
 {
     struct flb_oauth2 *ctx;
     struct flb_oauth2_config cfg;
+    struct flb_output_instance ins = {0};
+
+    ins.config = config;
 
     memset(&cfg, 0, sizeof(cfg));
 
@@ -756,7 +897,7 @@ static struct flb_oauth2 *create_private_key_jwt_ctx(struct flb_config *config,
     flb_sds_printf(&cfg.token_url, "http://127.0.0.1:%d/token", server->port);
     cfg.jwt_aud = flb_sds_create(cfg.token_url);
 
-    ctx = flb_oauth2_create_from_config(config, &cfg);
+    ctx = flb_oauth2_create_from_config(&ins, &cfg);
     flb_oauth2_config_destroy(&cfg);
 
     return ctx;
@@ -911,7 +1052,7 @@ void test_caching_and_refresh(void)
     config = flb_config_init();
     TEST_CHECK(config != NULL);
 
-    ret = oauth2_mock_server_start(&server, 65, 0);
+    ret = oauth2_mock_server_start(&server, 3600, 0);
     TEST_CHECK(ret == 0);
 
     ctx = create_oauth_ctx(config, &server, 58);
@@ -936,7 +1077,8 @@ void test_caching_and_refresh(void)
     TEST_CHECK(strcmp(token, "mock-token-1") == 0);
     TEST_CHECK(server.token_requests == 1);
 
-    sleep(2);
+    /* Exercise the refresh boundary without a one-second cache lifetime. */
+    ctx->expires_at = time(NULL) + ctx->refresh_skew;
 
     ret = flb_oauth2_get_access_token(ctx, &token, FLB_FALSE);
     TEST_CHECK(ret == 0);
@@ -946,6 +1088,80 @@ void test_caching_and_refresh(void)
     flb_oauth2_destroy(ctx);
     oauth2_mock_server_stop(&server);
     flb_config_exit(config);
+}
+
+static void check_legacy_manual_payload_flow(int jwt_bearer)
+{
+    int ret;
+    char *token;
+    struct flb_config *config;
+    struct flb_oauth2 *ctx;
+    struct oauth2_mock_server server;
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+
+    ret = oauth2_mock_server_start(&server, 3600, 0);
+    TEST_CHECK(ret == 0);
+
+    ctx = create_legacy_oauth_ctx(config, &server);
+    TEST_CHECK(ctx != NULL);
+
+#ifdef FLB_SYSTEM_MACOS
+    ret = oauth2_mock_server_wait_ready(&server);
+    TEST_CHECK(ret == 0);
+#endif
+
+    TEST_CHECK(ctx->cfg.enabled == FLB_TRUE);
+    flb_oauth2_payload_clear(ctx);
+
+    ret = flb_oauth2_payload_append(ctx, "grant_type", -1,
+                                    jwt_bearer ? "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
+                                               : "client_credentials", -1);
+    TEST_CHECK(ret == 0);
+
+    if (jwt_bearer) {
+        ret = flb_oauth2_payload_append(ctx, "assertion", -1, "header.payload.signature", -1);
+        TEST_CHECK(ret == 0);
+    }
+    else {
+        ret = flb_oauth2_payload_append(ctx, "client_id", -1, "legacy-id", -1);
+        TEST_CHECK(ret == 0);
+        ret = flb_oauth2_payload_append(ctx, "client_secret", -1, "legacy-secret", -1);
+        TEST_CHECK(ret == 0);
+    }
+
+    token = flb_oauth2_token_get(ctx);
+    TEST_CHECK(token != NULL);
+    TEST_CHECK(server.token_requests == 1);
+    if (token != NULL) {
+        TEST_CHECK(strcmp(token, "mock-token-1") == 0);
+    }
+    TEST_CHECK(strstr(server.latest_token_request,
+                      jwt_bearer ? "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
+                                 : "grant_type=client_credentials") != NULL);
+    if (jwt_bearer) {
+        TEST_CHECK(strstr(server.latest_token_request,
+                          "assertion=header.payload.signature") != NULL);
+    }
+    else {
+        TEST_CHECK(strstr(server.latest_token_request, "client_id=legacy-id") != NULL);
+        TEST_CHECK(strstr(server.latest_token_request, "client_secret=legacy-secret") != NULL);
+    }
+
+    flb_oauth2_destroy(ctx);
+    oauth2_mock_server_stop(&server);
+    flb_config_exit(config);
+}
+
+void test_legacy_create_manual_payload_flow(void)
+{
+    check_legacy_manual_payload_flow(FLB_FALSE);
+}
+
+void test_legacy_create_jwt_bearer_flow(void)
+{
+    check_legacy_manual_payload_flow(FLB_TRUE);
 }
 
 void test_private_key_jwt_body(void)
@@ -1069,7 +1285,54 @@ void test_private_key_jwt_x5t_header(void)
     flb_config_exit(config);
 }
 
+void test_hostname_verification_from_output_instance(void)
+{
+    int verify_hostname;
+    struct flb_config *config;
+    struct flb_oauth2 *ctx;
+    struct flb_output_instance ins = {0};
+    struct flb_oauth2_config cfg = {0};
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+    if (!config) {
+        return;
+    }
+
+    ins.config = config;
+    cfg.enabled = FLB_TRUE;
+    cfg.token_url = flb_sds_create("https://localhost/token");
+    TEST_CHECK(cfg.token_url != NULL);
+    if (!cfg.token_url) {
+        flb_config_exit(config);
+        return;
+    }
+
+    for (verify_hostname = FLB_FALSE; verify_hostname <= FLB_TRUE; verify_hostname++) {
+        ins.tls_verify_hostname = verify_hostname;
+
+        ctx = flb_oauth2_create(&ins, cfg.token_url, 300);
+        TEST_CHECK(ctx != NULL);
+        if (ctx) {
+            TEST_CHECK(ctx->tls->verify_hostname == verify_hostname);
+            flb_oauth2_destroy(ctx);
+        }
+
+        ctx = flb_oauth2_create_from_config(&ins, &cfg);
+        TEST_CHECK(ctx != NULL);
+        if (ctx) {
+            TEST_CHECK(ctx->tls->verify_hostname == verify_hostname);
+            flb_oauth2_destroy(ctx);
+        }
+    }
+
+    flb_oauth2_config_destroy(&cfg);
+    flb_config_exit(config);
+}
+
 TEST_LIST = {
+    {"hostname_verification_from_output_instance",
+     test_hostname_verification_from_output_instance},
     {"parse_refreshes_token_transactionally",
      test_parse_refreshes_token_transactionally},
     {"parse_accepts_quoted_expires_in", test_parse_accepts_quoted_expires_in},
@@ -1078,6 +1341,9 @@ TEST_LIST = {
      test_parse_rejects_missing_required_fields},
     {"parse_rejects_invalid_expires_in", test_parse_rejects_invalid_expires_in},
     {"caching_and_refresh", test_caching_and_refresh},
+    {"user_agent_header_optional", test_user_agent_header_optional},
+    {"legacy_create_manual_payload_flow", test_legacy_create_manual_payload_flow},
+    {"legacy_create_jwt_bearer_flow", test_legacy_create_jwt_bearer_flow},
     {"private_key_jwt_body", test_private_key_jwt_body},
     {"private_key_jwt_x5t_header", test_private_key_jwt_x5t_header},
     {0}

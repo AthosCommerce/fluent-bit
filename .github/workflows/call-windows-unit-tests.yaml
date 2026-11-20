@@ -37,20 +37,26 @@ jobs:
           - name: "Windows 32bit"
             arch: x86
             cmake_additional_opt: ""
+            runtime_tests: "Off"
             vcpkg_triplet: x86-windows-static
             cmake_version: "3.31.6"
             os: windows-latest
           - name: "Windows 64bit"
             arch: x64
             cmake_additional_opt: ""
+            runtime_tests: "On"
             vcpkg_triplet: x64-windows-static
             cmake_version: "3.31.6"
             os: windows-latest
           - name: "Windows 64bit (Arm64)"
             arch: amd64_arm64
-            cmake_additional_opt: "-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_VERSION=10.0 -DCMAKE_SYSTEM_PROCESSOR=ARM64"
+            cmake_additional_opt: >-
+              -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_VERSION=10.0
+              -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_POLICY_VERSION_MINIMUM="3.15"
+            runtime_tests: "Off"
             vcpkg_triplet: arm64-windows-static
-            cmake_version: "3.31.6"
+            # The ARM64 runner uses VS2026, which requires CMake 4.2 or newer.
+            cmake_version: "4.2.0"
             os: windows-11-arm
     permissions:
       contents: read
@@ -59,7 +65,7 @@ jobs:
       PATH: C:\ProgramData\Chocolatey\bin;c:/Program Files/Git/cmd;c:/Windows/system32;C:/Windows/System32/WindowsPowerShell/v1.0;$ENV:WIX/bin;C:/Program Files/CMake/bin;C:\vcpkg;
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
@@ -152,12 +158,12 @@ jobs:
         shell: pwsh
 
       - name: Set up with Developer Command Prompt for Microsoft Visual C++
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: ${{ matrix.config.arch }}
 
       - name: Get gzip command w/ chocolatey
-        uses: crazy-max/ghaction-chocolatey@v3
+        uses: crazy-max/ghaction-chocolatey@dfdcf5bba9c0a16358a21c13a06ec5c89024b3ac # v4.1.0
         with:
           args: install gzip -y
 
@@ -170,7 +176,7 @@ jobs:
 
       - name: Restore cached packages of vcpkg
         id: cache-unit-test-vcpkg-sources
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             C:\vcpkg\installed
@@ -196,7 +202,7 @@ jobs:
 
       - name: Save packages of vcpkg
         id: save-vcpkg-sources
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             C:\vcpkg\installed
@@ -207,6 +213,7 @@ jobs:
         run: |
           cmake -G "NMake Makefiles" `
             -D FLB_TESTS_INTERNAL=On `
+            -D FLB_TESTS_RUNTIME=${{ matrix.config.runtime_tests }} `
             -D FLB_NIGHTLY_BUILD='${{ inputs.unstable }}' `
             -D OPENSSL_ROOT_DIR='C:\vcpkg\installed\${{ matrix.config.vcpkg_triplet }}' `
             ${{ matrix.config.cmake_additional_opt }} `
@@ -214,9 +221,9 @@ jobs:
             -D FLB_WITHOUT_flb-rt-out_elasticsearch=On `
             -D FLB_WITHOUT_flb-rt-out_td=On `
             -D FLB_WITHOUT_flb-rt-out_forward=On `
+            -D FLB_WITHOUT_flb-rt-filter_rewrite_tag=On `
             -D FLB_WITHOUT_flb-rt-in_disk=On `
             -D FLB_WITHOUT_flb-rt-in_proc=On `
-            -D FLB_WITHOUT_flb-it-parser=On `
             -D FLB_WITHOUT_flb-it-unit_sizes=On `
             -D FLB_WITHOUT_flb-it-network=On `
             -D FLB_WITHOUT_flb-it-pack=On `
@@ -234,7 +241,7 @@ jobs:
         working-directory: build
 
       - name: Upload unit test binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-unit-tests-${{ matrix.config.arch }}
           path: |
@@ -246,8 +253,42 @@ jobs:
           dumpbin /dependents .\bin\fluent-bit.exe
         working-directory: build
 
+      - name: Check event channels and runtime startup
+        run: |
+            ctest --output-on-failure --no-tests=error --timeout 60 -R '^flb-it-pipe$'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ('${{ matrix.config.runtime_tests }}' -eq 'On') {
+              ctest --output-on-failure --no-tests=error --timeout 60 `
+                -R '^flb-rt-filter_modify/(op_set_append|invalid_wildcard)$'
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+        shell: pwsh
+        working-directory: build
+
+      - name: Set up Python for YAML include regressions
+        if: matrix.config.arch == 'x64'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Check Windows YAML include identities and junction contexts
+        if: matrix.config.arch == 'x64'
+        shell: pwsh
+        run: |
+          python -m pip install pytest==8.2.2 requests==2.32.3 PyYAML==6.0.1 psutil==7.2.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:FLUENT_BIT_BINARY = "$PWD/build/bin/fluent-bit.exe"
+          python -m pytest -q tests/integration/scenarios/hot_reload_watch/tests/test_include_identity.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run unit tests for Fluent Bit packages (x86, x64, and ARM64)
         run: |
-            ctest --build-run-dir "$PWD" --output-on-failure
+            $nparallel = 1
+            if ('${{ matrix.config.runtime_tests }}' -eq 'On') {
+              $nparallel = [Math]::Min([Environment]::ProcessorCount, 8)
+            }
+
+            Write-Host "Running CTest with parallel level $nparallel"
+            ctest --parallel $nparallel --build-run-dir "$PWD" --output-on-failure
         shell: pwsh
         working-directory: build

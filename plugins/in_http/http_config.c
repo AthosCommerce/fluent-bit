@@ -37,6 +37,8 @@ struct flb_http *http_config_create(struct flb_input_instance *ins)
     ctx->ins = ins;
 
     ctx->oauth2_cfg.jwks_refresh_interval = 300;
+    ctx->oauth2_cfg.jwks_buffer_max_size = 1000000;
+    ctx->oauth2_cfg.jwks_response_timeout = 30;
 
     /* Load the config map */
     ret = flb_input_config_map_set(ins, (void *) ctx);
@@ -47,7 +49,9 @@ struct flb_http *http_config_create(struct flb_input_instance *ins)
 
     /* Apply OAuth2 JWT config map properties if any */
     if (ins->oauth2_jwt_config_map && mk_list_size(&ins->oauth2_jwt_properties) > 0) {
-        ret = flb_config_map_set(&ins->oauth2_jwt_properties, ins->oauth2_jwt_config_map,
+        ret = flb_config_map_set(ins->config,
+                                 &ins->oauth2_jwt_properties,
+                                 ins->oauth2_jwt_config_map,
                                  &ctx->oauth2_cfg);
         if (ret == -1) {
             flb_free(ctx);

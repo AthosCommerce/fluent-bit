@@ -42,6 +42,13 @@
 /* Buffer size */
 #define FLB_HTTP_BUF_SIZE        2048
 #define FLB_HTTP_DATA_SIZE_MAX   4096
+
+/* Maximum response bytes received by a client-ng session. */
+#define FLB_HTTP_CLIENT_NG_RESPONSE_SIZE_MAX (4 * 1024 * 1024)
+#define FLB_HTTP_CLIENT_NG_HEADER_SIZE_MAX   65536
+#define FLB_HTTP_CLIENT_NG_WIRE_SIZE_MAX     (64 * 1024 * 1024)
+#define FLB_HTTP_CLIENT_NG_HEADER_COUNT_MAX  100
+#define FLB_HTTP_CLIENT_NG_RESPONSE_TIMEOUT   30
 #define FLB_HTTP_DATA_CHUNK     32768
 
 /* HTTP Methods */
@@ -116,8 +123,11 @@ struct flb_http_client_response {
     int content_length;        /* Content length set by headers */
     int chunked_encoding;      /* Chunked transfer encoding ?   */
     int connection_close;      /* connection: close ?           */
+    int chunked_trailer_pending; /* terminal chunk parsed        */
     char *chunk_processed_end; /* Position to mark last chunk   */
     char *headers_end;         /* Headers end (\r\n\r\n)        */
+    char *trailer_buf;         /* Raw trailer header block      */
+    size_t trailer_size;       /* Trailer block length          */
 
     /* Payload: body response: reference to 'data' */
     char *payload;
@@ -217,6 +227,8 @@ struct flb_test_http_response {
 struct flb_http_client {
     /* Upstream connection */
     struct flb_connection *u_conn;
+    struct flb_net_setup request_net_setup;
+    struct flb_net_setup *original_net_setup;
 
     /* Request data */
     int method;
@@ -227,6 +239,7 @@ struct flb_http_client {
     char *header_buf;
 
     /* Config */
+    int invalid_header;            /* reject requests with invalid headers */
     int allow_dup_headers;          /* allow duplicated headers      */
 
     /* incoming parameters */
@@ -270,6 +283,11 @@ struct flb_http_client_ng {
     uint16_t                port;
     uint64_t                flags;
     int                     protocol_version;
+    size_t                  max_response_size;
+    size_t                  max_header_size;
+    size_t                  max_wire_size;
+    size_t                  max_header_count;
+    int                     response_timeout;
     cfl_sds_t               temporary_buffer;
 
     int                     releasable;
@@ -287,6 +305,11 @@ struct flb_http_client_session {
     struct cfl_list                 streams;
 
     int                             protocol_version;
+    size_t                          received_bytes;
+    int                             response_limit_exceeded;
+    time_t                          response_start;
+    struct flb_net_setup            request_net_setup;
+    struct flb_net_setup           *original_net_setup;
 
     cfl_sds_t                       incoming_data;
     cfl_sds_t                       outgoing_data;
@@ -374,6 +397,11 @@ int flb_http_add_header(struct flb_http_client *c,
                         const char *val, size_t val_len);
 flb_sds_t flb_http_get_header(struct flb_http_client *c,
                               const char *key, size_t key_len);
+
+flb_sds_t flb_http_get_response_header(struct flb_http_client *c,
+                                       const char *key, size_t key_len);
+
+int flb_http_client_process_response_buffer(struct flb_http_client *c);
 int flb_http_basic_auth(struct flb_http_client *c,
                         const char *user, const char *passwd);
 int flb_http_proxy_auth(struct flb_http_client *c,
@@ -405,6 +433,7 @@ int flb_http_do(struct flb_http_client *c, size_t *bytes);
 int flb_http_do_with_oauth2(struct flb_http_client *c, size_t *bytes,
                             struct flb_oauth2 *oauth2);
 int flb_http_client_proxy_connect(struct flb_connection *u_conn);
+void flb_http_client_detach_connection(struct flb_http_client *c);
 void flb_http_client_destroy(struct flb_http_client *c);
 int flb_http_buffer_size(struct flb_http_client *c, size_t size);
 size_t flb_http_buffer_available(struct flb_http_client *c);

@@ -91,8 +91,11 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
     char *headers = "{\"alg\": \"RS256\", \"typ\": \"JWT\"}";
     unsigned char sha256_buf[32] = {0};
     flb_sds_t out;
+    flb_sds_t tmp;
     unsigned char sig[256] = {0};
     size_t sig_len;
+
+    sigd = NULL;
 
     buf_size = (strlen(payload) + strlen(secret)) * 2;
     buf = flb_malloc(buf_size);
@@ -120,16 +123,32 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
     }
 
     /* Append header */
-    out = flb_sds_cat(out, buf, olen);
-    out = flb_sds_cat(out, ".", 1);
+    tmp = flb_sds_cat(out, buf, olen);
+    if (!tmp) {
+        goto error;
+    }
+    out = tmp;
+
+    tmp = flb_sds_cat(out, ".", 1);
+    if (!tmp) {
+        goto error;
+    }
+    out = tmp;
 
     /* Encode Payload */
     len = strlen(payload);
-    bigquery_jwt_base64_url_encode((unsigned char *) buf, buf_size,
-                          (unsigned char *) payload, len, &olen);
+    ret = bigquery_jwt_base64_url_encode((unsigned char *) buf, buf_size,
+                                         (unsigned char *) payload, len, &olen);
+    if (ret == -1) {
+        goto error;
+    }
 
     /* Append Payload */
-    out = flb_sds_cat(out, buf, olen);
+    tmp = flb_sds_cat(out, buf, olen);
+    if (!tmp) {
+        goto error;
+    }
+    out = tmp;
 
     /* do sha256() of base64(header).base64(payload) */
     ret = flb_hash_simple(FLB_HASH_SHA256,
@@ -138,9 +157,7 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
 
     if (ret != FLB_CRYPTO_SUCCESS) {
         flb_plg_error(ctx->ins, "error hashing token");
-        flb_free(buf);
-        flb_sds_destroy(out);
-        return -1;
+        goto error;
     }
 
     /* In mbedTLS cert length must include the null byte */
@@ -157,9 +174,7 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
 
     if (ret != FLB_CRYPTO_SUCCESS) {
         flb_plg_error(ctx->ins, "error creating RSA context");
-        flb_free(buf);
-        flb_sds_destroy(out);
-        return -1;
+        goto error;
     }
 
     sigd = flb_malloc(2048);
@@ -170,10 +185,22 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
         return -1;
     }
 
-    bigquery_jwt_base64_url_encode((unsigned char *) sigd, 2048, sig, 256, &olen);
+    ret = bigquery_jwt_base64_url_encode((unsigned char *) sigd, 2048, sig, 256, &olen);
+    if (ret == -1) {
+        goto error;
+    }
 
-    out = flb_sds_cat(out, ".", 1);
-    out = flb_sds_cat(out, sigd, olen);
+    tmp = flb_sds_cat(out, ".", 1);
+    if (!tmp) {
+        goto error;
+    }
+    out = tmp;
+
+    tmp = flb_sds_cat(out, sigd, olen);
+    if (!tmp) {
+        goto error;
+    }
+    out = tmp;
 
     *out_signature = out;
     *out_size = flb_sds_len(out);
@@ -182,6 +209,13 @@ static int bigquery_jwt_encode(struct flb_bigquery *ctx,
     flb_free(sigd);
 
     return 0;
+
+error:
+    flb_free(buf);
+    flb_free(sigd);
+    flb_sds_destroy(out);
+
+    return -1;
 }
 
 /* Create a new oauth2 context and get a oauth2 token */
@@ -217,7 +251,8 @@ static int bigquery_get_oauth2_token(struct flb_bigquery *ctx)
         return -1;
     }
 
-    flb_plg_debug(ctx->ins, "JWT signature:\n%s", sig_data);
+    /* The assertion is a replayable credential; never log its contents. */
+    flb_plg_debug(ctx->ins, "JWT assertion generated");
 
     ret = flb_oauth2_payload_append(ctx->o,
                                     "grant_type", -1,
@@ -702,6 +737,7 @@ static int cb_bigquery_init(struct flb_output_instance *ins,
             flb_bigquery_conf_destroy(ctx);
             return -1;
         }
+        flb_tls_set_verify_hostname(ctx->aws_tls, ins->tls_verify_hostname);
 
         ctx->aws_provider = flb_standard_chain_provider_create(config,
                                                                ctx->aws_tls,
@@ -741,6 +777,7 @@ static int cb_bigquery_init(struct flb_output_instance *ins,
             flb_bigquery_conf_destroy(ctx);
             return -1;
         }
+        flb_tls_set_verify_hostname(ctx->aws_sts_tls, ins->tls_verify_hostname);
 
         ctx->aws_sts_upstream = flb_upstream_create(config,
                                                     ctx->aws_sts_endpoint,
@@ -772,6 +809,7 @@ static int cb_bigquery_init(struct flb_output_instance *ins,
             flb_bigquery_conf_destroy(ctx);
             return -1;
         }
+        flb_tls_set_verify_hostname(ctx->google_sts_tls, ins->tls_verify_hostname);
 
         ctx->google_sts_upstream = flb_upstream_create_url(config,
                                                            FLB_BIGQUERY_GOOGLE_STS_URL,
@@ -800,6 +838,7 @@ static int cb_bigquery_init(struct flb_output_instance *ins,
             flb_bigquery_conf_destroy(ctx);
             return -1;
         }
+        flb_tls_set_verify_hostname(ctx->google_iam_tls, ins->tls_verify_hostname);
 
         ctx->google_iam_upstream = flb_upstream_create_url(config,
                                                            FLB_BIGQUERY_GOOGLE_IAM_URL,
@@ -819,7 +858,7 @@ static int cb_bigquery_init(struct flb_output_instance *ins,
     }
 
     /* Create oauth2 context */
-    ctx->o = flb_oauth2_create(ctx->config, FLB_BIGQUERY_AUTH_URL, 3000);
+    ctx->o = flb_oauth2_create(ins, FLB_BIGQUERY_AUTH_URL, 3000);
     if (!ctx->o) {
         flb_plg_error(ctx->ins, "cannot create oauth2 context");
         return -1;
