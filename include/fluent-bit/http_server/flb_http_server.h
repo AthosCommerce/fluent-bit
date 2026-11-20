@@ -33,11 +33,9 @@
 #include <cfl/cfl_sds.h>
 
 #include <fluent-bit/flb_http_common.h>
+#include <fluent-bit/http_server/flb_http_server_config.h>
 #include <fluent-bit/http_server/flb_http_server_http1.h>
 #include <fluent-bit/http_server/flb_http_server_http2.h>
-
-#define HTTP_SERVER_INITIAL_BUFFER_SIZE        (10 * 1024)
-#define HTTP_SERVER_MAXIMUM_BUFFER_SIZE        (10 * (1000 * 1024))
 
 #define FLB_HTTP_SERVER_FLAG_KEEPALIVE         (((uint64_t) 1) << 0)
 #define FLB_HTTP_SERVER_FLAG_AUTO_DEFLATE      (((uint64_t) 1) << 1)
@@ -58,25 +56,19 @@ typedef int (*flb_http_server_request_processor_callback)(
                  struct flb_http_response *response);
 
 struct flb_http_server;
-struct flb_http_server_runtime;
+struct flb_downstream_worker_runtime;
 
 typedef int (*flb_http_server_worker_callback)(struct flb_http_server *server,
                                                void *data);
 
 struct flb_input_instance;
 
-struct flb_http_server_config {
-    int    http2;
-    size_t buffer_max_size;
-    size_t buffer_chunk_size;
-    size_t max_connections;
-    int    workers;
-};
-
 struct flb_http_server_options {
     int                                  protocol_version;
     uint64_t                             flags;
     flb_http_server_request_processor_callback request_callback;
+    /* Runs before inflation; nonzero means a rejection response was committed. */
+    flb_http_server_request_processor_callback authorization_callback;
     void                                *user_data;
 
     char                                *address;
@@ -87,9 +79,13 @@ struct flb_http_server_options {
     struct mk_event_loop                *event_loop;
     struct flb_config                   *system_context;
 
+    int                                  idle_timeout; /* seconds */
     size_t                               buffer_max_size;
+    size_t                               http1_max_header_size;
+    size_t                               max_decoded_body_size;
     size_t                               buffer_chunk_size;
     size_t                               max_connections;
+    uint64_t                            *connection_counter;
 
     /* Total number of worker listeners to spawn. */
     int                                  workers;
@@ -111,6 +107,9 @@ struct flb_http_server_options {
     flb_http_server_worker_callback      cb_worker_exit;
 };
 
+struct flb_http_server_balancer;
+struct flb_http_server_handoff;
+
 struct flb_http_server {
     /* Internal */
     struct mk_event        listener_event;
@@ -126,21 +125,33 @@ struct flb_http_server {
     uint64_t                            flags;
     int                                 status;
     int                                 protocol_version;
+    int                                 idle_timeout; /* seconds */
     struct flb_downstream              *downstream;
     struct cfl_list                     clients;
+    struct cfl_list                     detached_clients;
     flb_http_server_request_processor_callback request_callback;
+    /* Runs before inflation; nonzero means a rejection response was committed. */
+    flb_http_server_request_processor_callback authorization_callback;
     void                               *user_data;
     size_t                              buffer_max_size;
+    size_t                              http1_max_header_size;
+    size_t                              max_decoded_body_size;
     size_t                              buffer_chunk_size;
     size_t                              max_connections;
+    uint64_t                            active_connections;
+    uint64_t                           *connection_counter;
     int                                 workers;
     int                                 worker_id;
+    int                                 managed_worker;
     int                                 use_caller_event_loop;
     int                                 reuse_port;
     int                                 tls_alpn_configured;
     flb_http_server_worker_callback     cb_worker_init;
     flb_http_server_worker_callback     cb_worker_exit;
-    struct flb_http_server_runtime     *runtime;
+    struct flb_downstream_worker_runtime *runtime;
+    /* connection balancing between managed workers */
+    struct flb_http_server_balancer     *balancer;
+    struct flb_http_server_handoff      *handoff;
 };
 
 struct flb_http_server_session {
@@ -156,6 +167,10 @@ struct flb_http_server_session {
     size_t                          read_buffer_size;
 
     int                             releasable;
+    int                             drop_pending;
+    int                             destroying;
+    int                             connection_slot_reserved;
+    int                             balanced_connection;
 
     struct flb_connection          *connection;
     struct flb_http_server         *parent;
@@ -183,7 +198,6 @@ int flb_http_server_init(struct flb_http_server *session,
 
 void flb_http_server_options_init(struct flb_http_server_options *options);
 
-void flb_http_server_config_init(struct flb_http_server_config *config);
 
 int flb_http_server_options_init_from_input(struct flb_http_server_options *options,
                                             struct flb_input_instance *input_instance,
@@ -204,6 +218,10 @@ int flb_http_server_init_with_options(struct flb_http_server *session,
                                       struct flb_http_server_options *options);
 
 int flb_http_server_start(struct flb_http_server *session);
+
+int flb_http_server_pause(struct flb_http_server *session);
+
+int flb_http_server_resume(struct flb_http_server *session);
 
 int flb_http_server_stop(struct flb_http_server *session);
 

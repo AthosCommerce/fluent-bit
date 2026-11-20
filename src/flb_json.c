@@ -18,6 +18,7 @@
  */
 
 #include <fluent-bit/flb_json.h>
+#include <fluent-bit/flb_json_tree.h>
 
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_pack.h>
@@ -505,53 +506,24 @@ static yyjson_mut_val *msgpack_to_yyjson_mut(yyjson_mut_doc *document,
     }
 }
 
-static yyjson_mut_val *mutable_to_yyjson_mut(yyjson_mut_doc *document,
-                                             struct flb_json_mut_val *value)
+/*
+ * This limit prevents stack overflows in case mutable documents contain
+ * unexpectedly deep nesting or structural cycles.
+ */
+#define FLB_JSON_MUT_RENDER_MAX_DEPTH 1024
+
+static yyjson_mut_val *mutable_value_to_yyjson(yyjson_mut_doc *document,
+                                               struct flb_json_mut_val *value)
 {
-    struct flb_json_mut_kv    *kv_entry;
-    struct flb_json_mut_entry *array_entry;
-    yyjson_mut_val            *result;
-    yyjson_mut_val            *item;
+    if (value == NULL) {
+        return NULL;
+    }
 
     switch (value->type) {
     case FLB_JSON_MUT_OBJECT:
-        result = yyjson_mut_obj(document);
-        if (result == NULL) {
-            return NULL;
-        }
-
-        for (kv_entry = value->data.object.head;
-             kv_entry != NULL;
-             kv_entry = kv_entry->next) {
-            item = mutable_to_yyjson_mut(document, kv_entry->value);
-            if (item == NULL) {
-                return NULL;
-            }
-
-            if (!yyjson_mut_obj_add(result,
-                                    yyjson_mut_strcpy(document, kv_entry->key),
-                                    item)) {
-                return NULL;
-            }
-        }
-
-        return result;
+        return yyjson_mut_obj(document);
     case FLB_JSON_MUT_ARRAY:
-        result = yyjson_mut_arr(document);
-        if (result == NULL) {
-            return NULL;
-        }
-
-        for (array_entry = value->data.array.head;
-             array_entry != NULL;
-             array_entry = array_entry->next) {
-            item = mutable_to_yyjson_mut(document, array_entry->value);
-            if (item == NULL || !yyjson_mut_arr_add_val(result, item)) {
-                return NULL;
-            }
-        }
-
-        return result;
+        return yyjson_mut_arr(document);
     case FLB_JSON_MUT_STRING:
         return yyjson_mut_strcpy(document, value->data.string);
     case FLB_JSON_MUT_BOOL:
@@ -567,6 +539,115 @@ static yyjson_mut_val *mutable_to_yyjson_mut(yyjson_mut_doc *document,
     default:
         return NULL;
     }
+}
+
+/*
+ * Output workers run on small coroutine stacks, so the traversal keeps its own
+ * stack on the heap: even modest OTLP nesting expands into many JSON object and
+ * array layers.
+ */
+static yyjson_mut_val *mutable_to_yyjson_mut(yyjson_mut_doc *document,
+                                             struct flb_json_mut_val *value)
+{
+    struct render_frame {
+        yyjson_mut_val *output;
+        struct flb_json_mut_kv *object;
+        struct flb_json_mut_entry *array;
+    };
+    int ret;
+    struct render_frame *frames;
+    struct render_frame *frame;
+    struct flb_json_mut_val *child;
+    yyjson_mut_val *result;
+    yyjson_mut_val *item;
+    const char *key;
+    size_t depth;
+
+    result = mutable_value_to_yyjson(document, value);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    frames = flb_calloc(FLB_JSON_MUT_RENDER_MAX_DEPTH + 1, sizeof(*frames));
+    if (frames == NULL) {
+        flb_errno();
+        return NULL;
+    }
+
+    /* the root frame iterates the children of the top level container */
+    depth = 0;
+    frames[0].output = result;
+    if (value->type == FLB_JSON_MUT_OBJECT) {
+        frames[0].object = value->data.object.head;
+    }
+    else if (value->type == FLB_JSON_MUT_ARRAY) {
+        frames[0].array = value->data.array.head;
+    }
+
+    while (1) {
+        frame = &frames[depth];
+        key = NULL;
+
+        /* take the next child of the current container, or pop the frame */
+        if (frame->object != NULL) {
+            key = frame->object->key;
+            child = frame->object->value;
+            frame->object = frame->object->next;
+        }
+        else if (frame->array != NULL) {
+            child = frame->array->value;
+            frame->array = frame->array->next;
+        }
+        else {
+            if (depth == 0) {
+                break;
+            }
+            depth--;
+            continue;
+        }
+
+        item = mutable_value_to_yyjson(document, child);
+        if (item == NULL) {
+            result = NULL;
+            break;
+        }
+
+        if (key) {
+            ret = yyjson_mut_obj_add(frame->output, yyjson_mut_strcpy(document, key), item);
+        }
+        else {
+            ret = yyjson_mut_arr_add_val(frame->output, item);
+        }
+
+        if (!ret) {
+            result = NULL;
+            break;
+        }
+
+        /* containers get their own frame so their children are visited next */
+        if (child->type == FLB_JSON_MUT_OBJECT || child->type == FLB_JSON_MUT_ARRAY) {
+            if (depth == FLB_JSON_MUT_RENDER_MAX_DEPTH) {
+                result = NULL;
+                break;
+            }
+
+            frame = &frames[++depth];
+            frame->output = item;
+            frame->object = NULL;
+            frame->array = NULL;
+
+            if (child->type == FLB_JSON_MUT_OBJECT) {
+                frame->object = child->data.object.head;
+            }
+            else {
+                frame->array = child->data.array.head;
+            }
+        }
+    }
+
+    flb_free(frames);
+
+    return result;
 }
 
 static char *render_msgpack_document_yyjson(struct flb_json_doc *document,
@@ -707,6 +788,42 @@ static struct flb_json_mut_entry *mut_array_entry_create(struct flb_json_mut_doc
     document->entries = entry;
 
     return entry;
+}
+
+static int mut_val_contains(struct flb_json_mut_val *value,
+                            struct flb_json_mut_val *target)
+{
+    struct flb_json_mut_kv    *kv_entry;
+    struct flb_json_mut_entry *array_entry;
+
+    if (value == NULL || target == NULL) {
+        return FLB_FALSE;
+    }
+
+    if (value == target) {
+        return FLB_TRUE;
+    }
+
+    if (value->type == FLB_JSON_MUT_OBJECT) {
+        for (kv_entry = value->data.object.head;
+             kv_entry != NULL;
+             kv_entry = kv_entry->next) {
+            if (mut_val_contains(kv_entry->value, target)) {
+                return FLB_TRUE;
+            }
+        }
+    }
+    else if (value->type == FLB_JSON_MUT_ARRAY) {
+        for (array_entry = value->data.array.head;
+             array_entry != NULL;
+             array_entry = array_entry->next) {
+            if (mut_val_contains(array_entry->value, target)) {
+                return FLB_TRUE;
+            }
+        }
+    }
+
+    return FLB_FALSE;
 }
 
 static struct flb_json_mut_val *copy_msgpack_to_mutable(struct flb_json_mut_doc *document,
@@ -1544,6 +1661,10 @@ int flb_json_mut_arr_add_val(struct flb_json_mut_val *array,
         return 0;
     }
 
+    if (mut_val_contains(value, array)) {
+        return 0;
+    }
+
     entry = mut_array_entry_create(array->owner, value);
     if (entry == NULL) {
         return 0;
@@ -1724,6 +1845,10 @@ static int flb_json_mut_obj_add_val_len(struct flb_json_mut_doc *document,
         return 0;
     }
 
+    if (mut_val_contains(value, object)) {
+        return 0;
+    }
+
     entry = mut_kv_create(document, key, key_length, value);
     if (entry == NULL) {
         return 0;
@@ -1753,3 +1878,39 @@ int flb_json_mut_obj_add_val(struct flb_json_mut_doc *document,
     return flb_json_mut_obj_add_val_len(document, object, key,
                                         strlen(key), value);
 }
+
+#ifdef FLB_HAVE_YYJSON
+struct flb_json_tree *flb_json_tree_read(const char *input, size_t length)
+{
+    yyjson_alc allocator;
+
+    if (input == NULL) {
+        return NULL;
+    }
+
+    flb_json_yyjson_init_alc(&allocator);
+
+    return (struct flb_json_tree *) yyjson_read_opts((char *) input, length,
+                                                     YYJSON_READ_ALLOW_INVALID_UNICODE |
+                                                     YYJSON_READ_REPLACE_INVALID_UNICODE,
+                                                     &allocator, NULL);
+}
+
+void flb_json_tree_destroy(struct flb_json_tree *tree)
+{
+    yyjson_doc_free((yyjson_doc *) tree);
+}
+#else
+struct flb_json_tree *flb_json_tree_read(const char *input, size_t length)
+{
+    (void) input;
+    (void) length;
+
+    return NULL;
+}
+
+void flb_json_tree_destroy(struct flb_json_tree *tree)
+{
+    (void) tree;
+}
+#endif

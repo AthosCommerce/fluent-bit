@@ -24,9 +24,13 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_opentelemetry.h>
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_gzip.h>
 
+#include <stdint.h>
+
+#include <cfl/cfl_hash.h>
 #include <fluent-otel-proto/fluent-otel.h>
 
 #include "opentelemetry.h"
@@ -35,6 +39,7 @@
 
 #define RESOURCE_LOGS_INITIAL_CAPACITY 256
 #define SCOPE_LOGS_INITIAL_CAPACITY    100
+#define OTLP_GROUP_HASH_ERROR          UINT64_MAX
 
 static int hex_to_int(char ch)
 {
@@ -155,6 +160,160 @@ static int get_otlp_group_metadata(struct opentelemetry_context *ctx, struct flb
 
     flb_ra_key_value_destroy(ra_val);
     return 0;
+}
+
+static msgpack_object *msgpack_map_get_object(msgpack_object_map *map,
+                                              const char *key)
+{
+    int index;
+
+    index = flb_otel_utils_find_map_entry_by_key(map, (char *) key, 0, FLB_TRUE);
+    if (index < 0) {
+        return NULL;
+    }
+
+    return &map->ptr[index].val;
+}
+
+static uint32_t dropped_attribute_count(msgpack_object *object)
+{
+    msgpack_object *field;
+
+    if (!object || object->type != MSGPACK_OBJECT_MAP) {
+        return 0;
+    }
+
+    field = msgpack_map_get_object(&object->via.map, "dropped_attributes_count");
+    if (field && field->type == MSGPACK_OBJECT_POSITIVE_INTEGER &&
+        field->via.u64 <= UINT32_MAX) {
+        return (uint32_t) field->via.u64;
+    }
+
+    return 0;
+}
+
+static uint32_t group_dropped_attribute_count(msgpack_object *body, const char *kind)
+{
+    if (!body || body->type != MSGPACK_OBJECT_MAP) {
+        return 0;
+    }
+
+    return dropped_attribute_count(msgpack_map_get_object(&body->via.map, kind));
+}
+
+static uint64_t msgpack_object_hash(msgpack_object *object)
+{
+    uint64_t hash;
+    msgpack_sbuffer buffer;
+    msgpack_packer packer;
+
+    if (object == NULL) {
+        return cfl_hash_64bits("null", 4);
+    }
+
+    msgpack_sbuffer_init(&buffer);
+    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
+
+    if (msgpack_pack_object(&packer, *object) != 0) {
+        msgpack_sbuffer_destroy(&buffer);
+        return OTLP_GROUP_HASH_ERROR;
+    }
+
+    hash = cfl_hash_64bits(buffer.data, buffer.size);
+    msgpack_sbuffer_destroy(&buffer);
+
+    return hash;
+}
+
+static uint64_t msgpack_object_pair_hash(msgpack_object *left,
+                                         msgpack_object *right)
+{
+    uint64_t hash;
+    msgpack_sbuffer buffer;
+    msgpack_packer packer;
+
+    msgpack_sbuffer_init(&buffer);
+    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
+
+    if (msgpack_pack_array(&packer, 2) != 0) {
+        msgpack_sbuffer_destroy(&buffer);
+        return OTLP_GROUP_HASH_ERROR;
+    }
+
+    if (left == NULL) {
+        if (msgpack_pack_nil(&packer) != 0) {
+            msgpack_sbuffer_destroy(&buffer);
+            return OTLP_GROUP_HASH_ERROR;
+        }
+    }
+    else if (msgpack_pack_object(&packer, *left) != 0) {
+        msgpack_sbuffer_destroy(&buffer);
+        return OTLP_GROUP_HASH_ERROR;
+    }
+
+    if (right == NULL) {
+        if (msgpack_pack_nil(&packer) != 0) {
+            msgpack_sbuffer_destroy(&buffer);
+            return OTLP_GROUP_HASH_ERROR;
+        }
+    }
+    else if (msgpack_pack_object(&packer, *right) != 0) {
+        msgpack_sbuffer_destroy(&buffer);
+        return OTLP_GROUP_HASH_ERROR;
+    }
+
+    hash = cfl_hash_64bits(buffer.data, buffer.size);
+    msgpack_sbuffer_destroy(&buffer);
+
+    return hash;
+}
+
+static msgpack_object *resource_schema_url_object(msgpack_object *resource_object,
+                                                  msgpack_object *resource_body)
+{
+    msgpack_object *schema_url;
+
+    if (resource_body != NULL && resource_body->type == MSGPACK_OBJECT_MAP) {
+        schema_url = msgpack_map_get_object(&resource_body->via.map, "schema_url");
+        if (schema_url != NULL) {
+            return schema_url;
+        }
+    }
+
+    if (resource_object != NULL && resource_object->type == MSGPACK_OBJECT_MAP) {
+        schema_url = msgpack_map_get_object(&resource_object->via.map, "schema_url");
+        if (schema_url != NULL) {
+            return schema_url;
+        }
+    }
+
+    return NULL;
+}
+
+static uint64_t resource_identity_hash(msgpack_object *resource_object,
+                                       msgpack_object *resource_body)
+{
+    msgpack_object *schema_url;
+
+    schema_url = resource_schema_url_object(resource_object, resource_body);
+
+    return msgpack_object_pair_hash(resource_object, schema_url);
+}
+
+static void get_otlp_group_identity_hashes(msgpack_object *group_body,
+                                           uint64_t *resource_hash,
+                                           uint64_t *scope_hash)
+{
+    msgpack_object *resource_object = NULL;
+    msgpack_object *scope_object = NULL;
+
+    if (group_body != NULL && group_body->type == MSGPACK_OBJECT_MAP) {
+        resource_object = msgpack_map_get_object(&group_body->via.map, "resource");
+        scope_object = msgpack_map_get_object(&group_body->via.map, "scope");
+    }
+
+    *resource_hash = resource_identity_hash(resource_object, group_body);
+    *scope_hash = msgpack_object_hash(scope_object);
 }
 
 static inline int log_record_set_body(struct opentelemetry_context *ctx,
@@ -287,6 +446,9 @@ static int log_record_set_attributes(struct opentelemetry_context *ctx,
         }
 
         buf[attr_count] = msgpack_kv_to_otlp_any_value(kv);
+        if (buf[attr_count] == NULL) {
+            goto error;
+        }
         attr_count++;
     }
 
@@ -296,7 +458,13 @@ static int log_record_set_attributes(struct opentelemetry_context *ctx,
         for (i = 0; i < result.data.via.map.size; i++) {
             kv = &result.data.via.map.ptr[i];
             buf[attr_count] = msgpack_kv_to_otlp_any_value(kv);
-            attr_count++;
+            if (buf[attr_count] != NULL) {
+                attr_count++;
+            }
+            else if (kv->key.type == MSGPACK_OBJECT_STR) {
+                /* conversion failure, non-string keys are skipped */
+                goto error;
+            }
         }
         msgpack_unpacked_destroy(&result);
         flb_free(out_buf);
@@ -305,6 +473,14 @@ static int log_record_set_attributes(struct opentelemetry_context *ctx,
     log_record->attributes = buf;
     log_record->n_attributes = attr_count;
     return 0;
+
+error:
+    otlp_kvarray_destroy(buf, attr_count);
+    if (unpacked) {
+        msgpack_unpacked_destroy(&result);
+        flb_free(out_buf);
+    }
+    return -1;
 }
 
 static int pack_trace_id(struct opentelemetry_context *ctx,
@@ -314,6 +490,11 @@ static int pack_trace_id(struct opentelemetry_context *ctx,
     int ret;
 
     if (ra_val->o.type == MSGPACK_OBJECT_BIN) {
+        if (ra_val->o.via.bin.size != 16) {
+            flb_plg_warn(ctx->ins, "invalid trace_id size");
+            return -1;
+        }
+
         log_record->trace_id.data = flb_calloc(1, ra_val->o.via.bin.size);
         if (!log_record->trace_id.data) {
             return -1;
@@ -322,7 +503,8 @@ static int pack_trace_id(struct opentelemetry_context *ctx,
         log_record->trace_id.len = ra_val->o.via.bin.size;
     }
     else if (ra_val->o.type == MSGPACK_OBJECT_STR) {
-        if (ra_val->o.via.str.size > 32) {
+        if (ra_val->o.via.str.size != 32) {
+            flb_plg_warn(ctx->ins, "invalid trace_id size");
             return -1;
         }
 
@@ -355,7 +537,14 @@ static int pack_span_id(struct opentelemetry_context *ctx,
                         Opentelemetry__Proto__Logs__V1__LogRecord *log_record,
                         struct flb_ra_value *ra_val)
 {
+    int ret;
+
     if (ra_val->o.type == MSGPACK_OBJECT_BIN) {
+        if (ra_val->o.via.bin.size != 8) {
+            flb_plg_warn(ctx->ins, "invalid span_id size");
+            return -1;
+        }
+
         log_record->span_id.data = flb_calloc(1, ra_val->o.via.bin.size);
         if (!log_record->span_id.data) {
             return -1;
@@ -364,7 +553,8 @@ static int pack_span_id(struct opentelemetry_context *ctx,
         log_record->span_id.len = ra_val->o.via.bin.size;
     }
     else if (ra_val->o.type == MSGPACK_OBJECT_STR) {
-        if (ra_val->o.via.str.size > 16) {
+        if (ra_val->o.via.str.size != 16) {
+            flb_plg_warn(ctx->ins, "invalid span_id size");
             return -1;
         }
 
@@ -374,12 +564,21 @@ static int pack_span_id(struct opentelemetry_context *ctx,
             return -1;
         }
 
-        hex_to_id((char *) ra_val->o.via.str.ptr, ra_val->o.via.str.size,
-                  log_record->span_id.data, 8);
+        ret = hex_to_id((char *) ra_val->o.via.str.ptr, ra_val->o.via.str.size,
+                        log_record->span_id.data, 8);
+        if (ret != 0) {
+            flb_plg_warn(ctx->ins, "invalid span_id format");
+            flb_free(log_record->span_id.data);
+            log_record->span_id.data = NULL;
+            log_record->span_id.len = 0;
+            return -1;
+        }
+
         log_record->span_id.len = 8;
     }
     else {
         flb_plg_warn(ctx->ins, "invalid span_id type");
+        return -1;
     }
 
     return 0;
@@ -397,6 +596,9 @@ static int append_v1_logs_metadata_and_fields(struct opentelemetry_context *ctx,
     int trace_flags_set = FLB_FALSE;
     size_t attr_count = 0;
     struct flb_ra_value *ra_val;
+    msgpack_object *otlp_metadata;
+    msgpack_object *count_metadata;
+    msgpack_object *event_name;
     Opentelemetry__Proto__Common__V1__KeyValue **attrs = NULL;
 
     if (ctx == NULL || event == NULL || log_record == NULL) {
@@ -631,7 +833,7 @@ static int append_v1_logs_metadata_and_fields(struct opentelemetry_context *ctx,
     }
 
     /* TraceFlags */
-    ra_val = flb_ra_get_value_object(ctx->ra_trace_flags_metadata, *event->metadata);
+    ra_val = flb_ra_get_value_object(ctx->ra_log_meta_otlp_trace_flags, *event->metadata);
     if (ra_val != NULL) {
         if (ra_val->o.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
             log_record->flags = (uint32_t) ra_val->o.via.u64;
@@ -640,7 +842,7 @@ static int append_v1_logs_metadata_and_fields(struct opentelemetry_context *ctx,
         flb_ra_key_value_destroy(ra_val);
     }
 
-    if (!trace_flags_set) {
+    if (!trace_flags_set && ctx->ra_trace_flags_metadata) {
         ra_val = flb_ra_get_value_object(ctx->ra_trace_flags_metadata, *event->metadata);
         if (ra_val != NULL) {
             if (ra_val->o.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
@@ -648,6 +850,29 @@ static int append_v1_logs_metadata_and_fields(struct opentelemetry_context *ctx,
                 trace_flags_set = FLB_TRUE;
             }
             flb_ra_key_value_destroy(ra_val);
+        }
+    }
+
+    if (event->metadata && event->metadata->type == MSGPACK_OBJECT_MAP) {
+        otlp_metadata = msgpack_map_get_object(&event->metadata->via.map, "otlp");
+        count_metadata = msgpack_map_get_object(&event->metadata->via.map, ctx->logs_metadata_key);
+        if (count_metadata == NULL) {
+            count_metadata = otlp_metadata;
+        }
+        log_record->dropped_attributes_count = dropped_attribute_count(count_metadata);
+
+        event_name = NULL;
+        if (otlp_metadata && otlp_metadata->type == MSGPACK_OBJECT_MAP) {
+            event_name = msgpack_map_get_object(&otlp_metadata->via.map, "event_name");
+        }
+
+        if (event_name && event_name->type == MSGPACK_OBJECT_STR) {
+            log_record->event_name = flb_strndup(event_name->via.str.ptr,
+                                                 event_name->via.str.size);
+            if (!log_record->event_name) {
+                flb_errno();
+                return -1;
+            }
         }
     }
 
@@ -678,6 +903,9 @@ static void free_log_records(Opentelemetry__Proto__Logs__V1__LogRecord **logs, s
         if (log->severity_text != NULL && log->severity_text != protobuf_c_empty_string) {
             flb_free(log->severity_text);
         }
+        if (log->event_name != NULL && log->event_name != protobuf_c_empty_string) {
+            flb_free(log->event_name);
+        }
         if (log->span_id.data != NULL) {
             flb_free(log->span_id.data);
         }
@@ -686,6 +914,36 @@ static void free_log_records(Opentelemetry__Proto__Logs__V1__LogRecord **logs, s
         }
 
         flb_free(log);
+    }
+}
+
+/*
+ * Release the log records of a request that was already sent, keeping its
+ * resources and scopes, so a later request of the same chunk does not repeat
+ * them.
+ */
+static void release_sent_log_records(Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *export_logs)
+{
+    size_t i;
+    size_t j;
+    Opentelemetry__Proto__Logs__V1__ResourceLogs *resource_log;
+    Opentelemetry__Proto__Logs__V1__ScopeLogs *scope_log;
+
+    for (i = 0; i < export_logs->n_resource_logs; i++) {
+        resource_log = export_logs->resource_logs[i];
+        if (resource_log == NULL) {
+            continue;
+        }
+
+        for (j = 0; j < resource_log->n_scope_logs; j++) {
+            scope_log = resource_log->scope_logs[j];
+            if (scope_log == NULL || scope_log->log_records == NULL) {
+                continue;
+            }
+
+            free_log_records(scope_log->log_records, scope_log->n_log_records);
+            scope_log->n_log_records = 0;
+        }
     }
 }
 
@@ -702,15 +960,21 @@ static void free_resource_logs(Opentelemetry__Proto__Logs__V1__ResourceLogs **re
 
     for (i = 0 ; i < resource_count ; i++) {
         resource_log = resource_logs[i];
+        if (resource_log == NULL) {
+            continue;
+        }
 
         if (resource_log->schema_url != NULL && resource_log->schema_url != protobuf_c_empty_string) {
             flb_sds_destroy(resource_log->schema_url);
         }
 
-        if (resource_log->resource->attributes != NULL) {
-            otlp_kvarray_destroy(resource_log->resource->attributes, resource_log->resource->n_attributes);
+        if (resource_log->resource != NULL) {
+            if (resource_log->resource->attributes != NULL) {
+                otlp_kvarray_destroy(resource_log->resource->attributes,
+                                     resource_log->resource->n_attributes);
+            }
+            flb_free(resource_log->resource);
         }
-        flb_free(resource_log->resource);
 
         /* iterate scoipe logs */
         if (resource_log->n_scope_logs > 0) {
@@ -737,6 +1001,11 @@ static void free_resource_logs(Opentelemetry__Proto__Logs__V1__ResourceLogs **re
                     free_log_records(scope_log->log_records, scope_log->n_log_records);
                 }
 
+                if (scope_log->schema_url != NULL &&
+                    scope_log->schema_url != protobuf_c_empty_string) {
+                    flb_sds_destroy(scope_log->schema_url);
+                }
+
                 flb_free(scope_log->log_records);
                 flb_free(scope_log);
             }
@@ -749,7 +1018,9 @@ static void free_resource_logs(Opentelemetry__Proto__Logs__V1__ResourceLogs **re
     flb_free(resource_logs);
 }
 
-static int logs_flush_to_otel(struct opentelemetry_context *ctx, struct flb_event_chunk *event_chunk,
+static int logs_flush_to_otel(struct opentelemetry_context *ctx,
+                              struct flb_event_chunk *event_chunk,
+                              struct flb_output_flush *out_flush,
                               Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *export_logs)
 {
     int ret;
@@ -774,7 +1045,8 @@ static int logs_flush_to_otel(struct opentelemetry_context *ctx, struct flb_even
                              event_chunk->tag,
                              flb_sds_len(event_chunk->tag),
                              ctx->logs_uri_sanitized,
-                             ctx->grpc_logs_uri);
+                             ctx->grpc_logs_uri,
+                             out_flush);
     flb_free(body);
 
     return ret;
@@ -948,9 +1220,13 @@ int otel_process_logs(struct flb_event_chunk *event_chunk,
     int ret;
     int record_type;
     int log_record_count;
+    int pending_records = 0;
     int max_scopes_limit;
     int max_resources;
     int native_otel = FLB_FALSE;
+    int inside_native_otel_group = FLB_FALSE;
+    int standalone_context_active = FLB_FALSE;
+    int force_new_resource = FLB_FALSE;
     size_t resource_logs_capacity;
     size_t i;
     size_t new_capacity;
@@ -961,6 +1237,10 @@ int otel_process_logs(struct flb_event_chunk *event_chunk,
     int64_t scope_id = -1;
     int64_t tmp_resource_id = -1;
     int64_t tmp_scope_id = -1;
+    uint64_t resource_hash = 0;
+    uint64_t scope_hash = 0;
+    uint64_t tmp_resource_hash = 0;
+    uint64_t tmp_scope_hash = 0;
     struct flb_log_event_decoder *decoder;
     struct flb_log_event event;
     struct opentelemetry_context *ctx;
@@ -1040,15 +1320,50 @@ int otel_process_logs(struct flb_event_chunk *event_chunk,
             ret = get_otlp_group_metadata(ctx, &event, &tmp_resource_id, &tmp_scope_id);
             if (ret == -1) {
                 /* skip unknown group info */
+                inside_native_otel_group = FLB_FALSE;
+                standalone_context_active = FLB_FALSE;
                 continue;
             }
 
-            /* flag this as a native otel schema */
-            native_otel = FLB_TRUE;
+            get_otlp_group_identity_hashes(event.body,
+                                           &tmp_resource_hash,
+                                           &tmp_scope_hash);
+            if (tmp_resource_hash == OTLP_GROUP_HASH_ERROR ||
+                tmp_scope_hash == OTLP_GROUP_HASH_ERROR) {
+                flb_plg_error(ctx->ins, "could not compute OTLP group identity hash");
+                ret = FLB_RETRY;
+                break;
+            }
 
+            /* flag this as a native otel schema */
+            if (standalone_context_active == FLB_TRUE) {
+                resource_id = -1;
+                scope_id = -1;
+                resource_hash = 0;
+                scope_hash = 0;
+                resource_log = NULL;
+                scope_log = NULL;
+                standalone_context_active = FLB_FALSE;
+            }
+
+            native_otel = FLB_TRUE;
+            inside_native_otel_group = FLB_TRUE;
+
+            force_new_resource = FLB_FALSE;
+            if (resource_id == tmp_resource_id &&
+                resource_hash == tmp_resource_hash &&
+                (scope_id != tmp_scope_id || scope_hash != tmp_scope_hash) &&
+                max_scopes_limit > 0 &&
+                resource_log != NULL &&
+                resource_log->n_scope_logs >= max_scopes_limit) {
+                force_new_resource = FLB_TRUE;
+            }
 
             /* if we have a new resource_id, start a new resource context */
-            if (resource_id != tmp_resource_id) {
+start_resource:
+            if (force_new_resource == FLB_TRUE ||
+                resource_id != tmp_resource_id ||
+                resource_hash != tmp_resource_hash) {
                 if (max_resources > 0) {
                     if (export_logs.n_resource_logs >= max_resources) {
                         /* respect the configured resource batching limit */
@@ -1097,7 +1412,6 @@ int otel_process_logs(struct flb_event_chunk *event_chunk,
                     resource_logs_capacity = new_capacity;
                 }
 
-start_resource:
                 /*
                 * On every group start, check if we are following the previous resource_id or not, so we can pack scopes
                 * under the right resource.
@@ -1119,7 +1433,10 @@ start_resource:
                 resource_log->resource = flb_calloc(1, sizeof(Opentelemetry__Proto__Resource__V1__Resource));
                 if (!resource_log->resource) {
                     flb_errno();
+                    resource_logs[export_logs.n_resource_logs - 1] = NULL;
+                    export_logs.n_resource_logs--;
                     flb_free(resource_log);
+                    resource_log = NULL;
                     ret = FLB_RETRY;
                     break;
                 }
@@ -1127,6 +1444,10 @@ start_resource:
 
                 /* group body: $resource['attributes'] */
                 set_resource_attributes(ctx->ra_resource_attr, event.body, resource_log->resource);
+                if (inside_native_otel_group == FLB_TRUE) {
+                    resource_log->resource->dropped_attributes_count =
+                        group_dropped_attribute_count(event.body, "resource");
+                }
 
                 /* group body: $schema_url */
                 set_resource_schema_url(ctx->ra_resource_schema_url, event.body, resource_log);
@@ -1157,10 +1478,13 @@ start_resource:
 
                 /* update the current resource_id and reset scope_id */
                 resource_id = tmp_resource_id;
+                resource_hash = tmp_resource_hash;
                 scope_id = -1;
+                scope_hash = 0;
+                force_new_resource = FLB_FALSE;
             }
 
-            if (scope_id != tmp_scope_id) {
+            if (scope_id != tmp_scope_id || scope_hash != tmp_scope_hash) {
                 resource_index = export_logs.n_resource_logs - 1;
 
                 /* check limits */
@@ -1221,6 +1545,7 @@ start_resource:
                 }
                 opentelemetry__proto__common__v1__instrumentation_scope__init(scope_log->scope);
                 scope_id = tmp_scope_id;
+                scope_hash = tmp_scope_hash;
 
                 log_records = flb_calloc(ctx->batch_size, sizeof(Opentelemetry__Proto__Logs__V1__LogRecord *));
                 if (!log_records) {
@@ -1244,6 +1569,10 @@ start_resource:
 
                 /* group body: $scope['attributes'] */
                 set_scope_attributes(ctx->ra_scope_attr, event.body, scope_log->scope);
+                if (inside_native_otel_group == FLB_TRUE) {
+                    scope_log->scope->dropped_attributes_count =
+                        group_dropped_attribute_count(event.body, "scope");
+                }
 
                 /* group body: $scope['schema_url'] */
                 set_scope_schema_url(ctx->ra_scope_schema_url, event.body, scope_log);
@@ -1263,15 +1592,16 @@ start_resource:
         else if (record_type == FLB_LOG_EVENT_GROUP_END) {
             /* do nothing */
             ret = FLB_OK;
-            resource_id = -1;
-            scope_id = -1;
             native_otel = FLB_FALSE;
+            inside_native_otel_group = FLB_FALSE;
 
             continue;
         }
 
         /* if we have a real OTLP context package using log_records */
-        if (resource_id >= 0 && scope_id >= 0) {
+        if ((inside_native_otel_group == FLB_TRUE ||
+             standalone_context_active == FLB_TRUE) &&
+            resource_id >= 0 && scope_id >= 0) {
 
         }
         else {
@@ -1279,8 +1609,28 @@ start_resource:
              * standalone packaging: the record is not part of an original OTLP structure, so there is no group
              * information. We create a temporary resource for the incoming records unless a group is defined.
              */
+            if (standalone_context_active == FLB_FALSE) {
+                resource_id = -1;
+                scope_id = -1;
+                resource_hash = 0;
+                scope_hash = 0;
+                resource_log = NULL;
+                scope_log = NULL;
+                standalone_context_active = FLB_TRUE;
+            }
+
             tmp_resource_id = 0;
             tmp_scope_id = 0;
+            get_otlp_group_identity_hashes(NULL,
+                                           &tmp_resource_hash,
+                                           &tmp_scope_hash);
+            if (tmp_resource_hash == OTLP_GROUP_HASH_ERROR ||
+                tmp_scope_hash == OTLP_GROUP_HASH_ERROR) {
+                flb_plg_error(ctx->ins, "could not compute default OTLP group identity hash");
+                ret = FLB_RETRY;
+                break;
+            }
+            force_new_resource = FLB_FALSE;
             goto start_resource;
         }
 
@@ -1329,20 +1679,30 @@ start_resource:
 
         ret = FLB_OK;
         log_record_count++;
+        pending_records++;
         scope_log->n_log_records = log_record_count;
 
         if (log_record_count >= ctx->batch_size) {
-            ret = logs_flush_to_otel(ctx, event_chunk, &export_logs);
-            free_log_records(log_records, log_record_count);
+            ret = logs_flush_to_otel(ctx, event_chunk, out_flush, &export_logs);
+            release_sent_log_records(&export_logs);
             log_record_count = 0;
-            scope_log->n_log_records = 0;
+            pending_records = 0;
+
+            /* Do not let a later batch overwrite this failure. */
+            if (ret != FLB_OK) {
+                break;
+            }
         }
     }
 
     flb_log_event_decoder_destroy(decoder);
 
-    if (log_record_count > 0 && ret == FLB_OK) {
-        ret = logs_flush_to_otel(ctx, event_chunk, &export_logs);
+    /*
+     * Records of earlier scopes are pending too: a chunk can end with a group
+     * that has no records yet, for example one opened by the previous append.
+     */
+    if (pending_records > 0 && ret == FLB_OK) {
+        ret = logs_flush_to_otel(ctx, event_chunk, out_flush, &export_logs);
     }
 
     /* release all protobuf resources */

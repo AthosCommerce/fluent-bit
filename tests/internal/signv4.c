@@ -271,12 +271,12 @@ static struct flb_http_client *convert_request_file(char *request,
     struct mk_list *head;
     struct flb_kv *kv;
     struct request *req;
+    char *query_string;
 
     /* Fake Upstream context, required by http client */
     u = flb_upstream_create(config, "127.0.0.1", 80, 0, NULL);
     if (!u) {
         fprintf(stderr, "error creating upstream context");
-        flb_free(config);
         return NULL;
     }
 
@@ -285,7 +285,7 @@ static struct flb_http_client *convert_request_file(char *request,
     if (!u_conn) {
         flb_errno();
         flb_upstream_destroy(u);
-        flb_free(config);
+        return NULL;
     }
     u_conn->upstream = u;
 
@@ -293,13 +293,31 @@ static struct flb_http_client *convert_request_file(char *request,
     req = http_request_create(request);
     if (!req) {
         fprintf(stderr, "error parsing txt http request");
-        exit(1);
+        flb_free(u_conn);
+        flb_upstream_destroy(u);
+        return NULL;
     }
 
-    /* HTTP Client context */
-    c = flb_http_client(u_conn, req->method_i, req->uri_full,
+    /*
+     * These signing fixtures include raw spaces, which are not valid HTTP
+     * request targets. Create a client with a valid placeholder and supply
+     * the original URI directly to the signer. No request is sent.
+     */
+    c = flb_http_client(u_conn, req->method_i, "/",
                         req->payload, req->payload ? flb_sds_len(req->payload): -1,
                         NULL, -1, NULL, 0);
+    if (!c) {
+        http_request_destroy(req);
+        flb_free(u_conn);
+        flb_upstream_destroy(u);
+        return NULL;
+    }
+
+    c->uri = req->uri_full;
+    query_string = strchr(req->uri_full, '?');
+    if (query_string) {
+        c->query_string = query_string + 1;
+    }
 
     /*
      * flb_http_client automatically adds host and content-length
@@ -358,6 +376,9 @@ static flb_sds_t file_to_buffer(char *path, char *context, char *ext)
 
 static void aws_test_destroy(struct aws_test *awt)
 {
+    struct flb_connection *u_conn;
+    struct flb_upstream *upstream;
+
     if (awt->name) {
         flb_sds_destroy(awt->name);
     }
@@ -378,9 +399,11 @@ static void aws_test_destroy(struct aws_test *awt)
     }
 
     if (awt->c) {
-        flb_upstream_destroy(awt->c->u_conn->upstream);
-        flb_free(awt->c->u_conn);
+        u_conn = awt->c->u_conn;
+        upstream = u_conn->upstream;
         flb_http_client_destroy(awt->c);
+        flb_free(u_conn);
+        flb_upstream_destroy(upstream);
     }
 
     http_request_destroy(awt->r);
@@ -437,6 +460,7 @@ static struct aws_test *aws_test_create(char *path, char *context,
 
     /* Convert TXT HTTP request to http_client context */
     awt->c = convert_request_file(awt->req, &awt->r, config);
+    TEST_CHECK(awt->c != NULL);
     if (!awt->c) {
         fprintf(stderr, "error converting TXT request to a context: %s", awt->name);
         goto error;

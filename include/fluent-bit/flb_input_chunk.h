@@ -32,8 +32,8 @@ struct cio_chunk;
 #include <msgpack.h>
 
 /*
- * This variable defines a 'hint' size for new Chunks created, this
- * value is passed to Chunk I/O.
+ * Default allocation hint for memory chunks. Filesystem chunks use the
+ * pending append size, including their headers and metadata.
  */
 #define FLB_INPUT_CHUNK_SIZE           262144  /* 256KB (hint) */
 /*
@@ -124,11 +124,21 @@ int flb_input_chunk_append_raw(struct flb_input_instance *in,
                                size_t records,
                                const char *tag, size_t tag_len,
                                const void *buf, size_t buf_size);
+int flb_input_chunk_append_raw_local(struct flb_input_instance *in,
+                                     int event_type,
+                                     size_t records,
+                                     const char *tag, size_t tag_len,
+                                     const void *buf, size_t buf_size);
 int flb_input_chunk_ring_buffer_enqueue(struct flb_input_instance *in,
                                         int event_type,
                                         size_t records,
                                         const char *tag, size_t tag_len,
                                         const void *buf, size_t buf_size);
+int flb_input_chunk_ring_buffer_enqueue_log_routing(struct flb_input_instance *in,
+                                                    int event_type,
+                                                    size_t records,
+                                                    const char *tag, size_t tag_len,
+                                                    const void *buf, size_t buf_size);
 
 const void *flb_input_chunk_flush(struct flb_input_chunk *ic, size_t *size);
 int flb_input_chunk_release_lock(struct flb_input_chunk *ic);
@@ -156,6 +166,10 @@ void flb_input_chunk_ring_buffer_cleanup(struct flb_input_instance *ins);
 void flb_input_chunk_ring_buffer_collector(struct flb_config *ctx, void *data);
 ssize_t flb_input_chunk_get_size(struct flb_input_chunk *ic);
 ssize_t flb_input_chunk_get_real_size(struct flb_input_chunk *ic);
+int flb_input_chunk_release_route(struct flb_input_chunk *ic,
+                                  struct flb_output_instance *o_ins);
+void flb_input_chunk_output_size_subtract(struct flb_output_instance *o_ins,
+                                          size_t bytes);
 size_t flb_input_chunk_set_limits(struct flb_input_instance *in);
 size_t flb_input_chunk_total_size(struct flb_input_instance *in);
 struct flb_input_chunk *flb_input_chunk_map(struct flb_input_instance *in,
@@ -165,7 +179,11 @@ int flb_input_chunk_set_up_down(struct flb_input_chunk *ic);
 int flb_input_chunk_set_up(struct flb_input_chunk *ic);
 int flb_input_chunk_down(struct flb_input_chunk *ic);
 int flb_input_chunk_is_up(struct flb_input_chunk *ic);
+int flb_input_chunk_find_space_new_data(struct flb_input_chunk *ic,
+                                        size_t chunk_size);
+int flb_input_chunk_has_overlimit_routes(struct flb_input_chunk *ic,
+                                         size_t chunk_size);
 void flb_input_chunk_update_output_instances(struct flb_input_chunk *ic,
-                                             size_t chunk_size);
+                                             ssize_t chunk_size);
 
 #endif

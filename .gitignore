@@ -8,6 +8,10 @@ lib/jemalloc
 tests/internal/flb_tests_internal.h
 tests/runtime/flb_tests_runtime.h
 build/*
+/build-wasm/
+/build-wasm-asan/
+/build-wasm-release/
+/build-wasm-*/
 include/fluent-bit/flb_info.h
 include/fluent-bit/flb_plugins.h
 include/fluent-bit/flb_version.h
@@ -41,3 +45,7 @@ workflow/
 examples/wasi_serde_json/target/
 # WASM test data
 tests/runtime/wasm/go/*.wasm
+tests/integration/.venv/
+tests/integration/.pytest_cache/
+tests/integration/**/__pycache__/
+tests/integration/results/

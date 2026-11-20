@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_oauth2.h>
+#include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_sds.h>
 
 /* refresh token every 50 minutes */
@@ -44,6 +45,26 @@
 #define FLB_CHRONICLE_URL_BASE_UK           "https://europe-west2-malachiteingestion-pa.googleapis.com"
 #define FLB_CHRONICLE_URL_BASE_ASIA         "https://asia-southeast1-malachiteingestion-pa.googleapis.com"
 
+/* Maximum size of a request body for the legacy Ingestion API */
+#define FLB_CHRONICLE_MAX_PAYLOAD_SIZE      (1024 * 1024)
+
+/* Ingestion APIs */
+#define FLB_CHRONICLE_API_LEGACY            0
+#define FLB_CHRONICLE_API_CHRONICLE         1
+
+/* Chronicle API (logs:import) */
+#define FLB_CHRONICLE_API_SCOPE             "https://www.googleapis.com/auth/cloud-platform"
+#define FLB_CHRONICLE_API_DEFAULT_LOCATION  "us"
+#define FLB_CHRONICLE_API_URL_BASE          "https://%s-chronicle.googleapis.com"
+#define FLB_CHRONICLE_API_IMPORT_ENDPOINT   \
+    "/v1/projects/%s/locations/%s/instances/%s/logTypes/%s/logs:import"
+
+/* Maximum size of a request body for the Chronicle API (4 MB) */
+#define FLB_CHRONICLE_API_MAX_PAYLOAD_SIZE  (4 * 1000 * 1000)
+
+/* Delay added to the collection time of records that are not in the past */
+#define FLB_CHRONICLE_API_COLLECTION_DELAY_NS  1000000
+
 struct flb_chronicle_oauth_credentials {
     /* parsed credentials file */
     flb_sds_t type;
@@ -54,6 +75,13 @@ struct flb_chronicle_oauth_credentials {
     flb_sds_t client_id;
     flb_sds_t auth_uri;
     flb_sds_t token_uri;
+};
+
+struct flb_chronicle_label {
+    flb_sds_t key;
+    flb_sds_t value;
+    struct flb_record_accessor *ra;
+    struct mk_list _head;
 };
 
 struct flb_chronicle {
@@ -67,11 +95,26 @@ struct flb_chronicle {
     flb_sds_t customer_id;
     flb_sds_t log_type;
 
+    /* ingestion API: legacy Ingestion API or Chronicle API */
+    flb_sds_t api_str;
+    int api;
+    size_t max_payload_size;
+
+    /* request body compression */
+    flb_sds_t compress_str;
+    int compress_gzip;
+
     flb_sds_t uri;
     flb_sds_t health_uri;
     flb_sds_t endpoint;
     flb_sds_t region;
+    flb_sds_t location;
     flb_sds_t log_key;
+    flb_sds_t namespace;
+    flb_sds_t namespace_key;
+    struct flb_record_accessor *namespace_ra;
+    struct mk_list *label_properties;
+    struct mk_list labels;
 
     int json_date_format;
     flb_sds_t json_date_key;
